@@ -9,17 +9,21 @@ import socket
 import select
 import struct
 import ssl
+import subprocess
 import threading
 #  import time
 import logging
 log = logging.getLogger(__name__)
 
+SO_ORIGINAL_DST = 80
+
 
 class Connection(threading.Thread):
-    def __init__(self, server_sock, client_sock):
+    def __init__(self, server_sock, client_sock, pre_mirror=False):
         super(Connection, self).__init__()
         self.server_sock = server_sock
         self.client_sock = client_sock
+        self.pre_mirror = pre_mirror
         self.active = True
         self.init_sockets()
         self.run()
@@ -64,7 +68,7 @@ class Connection(threading.Thread):
     def forward_data(self):
         '''Move data from each socket to the other'''
         log.debug('selecting sockets...')
-        r, w, _ = select.select(self.read_socks, self.write_socks, [])
+        r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
         self.write_socks = []
         for conn in r:
             self.read_from_sock(conn)
@@ -172,7 +176,6 @@ class Connection(threading.Thread):
 
 def original_dst(conn):
     '''Find original destination of an incoming connection'''
-    SO_ORIGINAL_DST = 80
     original_dst = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
     original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
                                                        original_dst)
@@ -180,52 +183,73 @@ def original_dst(conn):
     return original_srv_ip, original_srv_port
 
 
-def open_connection(ip, port, local_conn):
+def open_connection(ip, port):
     '''Open a connection to the original destination'''
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    ip = 'localhost'
-    sock.connect((ip, port+1))
+    sock.connect((ip, port))
     sock.setblocking(False)
     return sock
 
 
-def accept(sock):
+def accept(sock, pre_mirror=False):
     '''Accept incoming connection and pair it with one to original dest'''
     conn, addr = sock.accept()  # Should be ready
     orig_ip, orig_port = original_dst(conn)
     log.info('accepted from %s:%d with original destination %s:%d' %
              (*addr, orig_ip, orig_port))
     conn.setblocking(False)
-    try:
-        other_conn = open_connection(orig_ip, orig_port, conn)
-        log.debug('created connection pair: %s, %s' % (conn, other_conn))
-        return conn, other_conn
-    except Exception as e:
-        log.error('error while opening connection to original destination:'
-                  ' %s' % e)
-        conn.close()
-        return None, None
+    #  try:
+    if pre_mirror:
+        other_conn = open_connection('192.168.253.1', 1235)
+        #  dst = struct.pack("!2xH4s8x", orig_port, orig_ip.encode())
+        #  other_conn.setsockopt(socket.SOL_IP, SO_ORIGINAL_DST, dst)
+    else:
+        # TODO ip for debugging
+        other_conn = open_connection('127.0.0.2', 1235)
+    log.debug('created connection pair: %s, %s' % (conn, other_conn))
+    return conn, other_conn
+    #  except Exception as e:
+    #      log.error('error while opening connection to original destination:'
+    #                ' %s' % e)
+    #      conn.close()
+    #      return None, None
 
 
-def start_data_forwarding(sock):
-    active = True
-    try:
-        while active:
-            s, c = accept(sock)
-            if s and c:
-                Connection(s, c)
-    except KeyboardInterrupt:
-        print('\r', end='')  # prevent '^C' on console
-        log.info('Caught Ctrl-C, exiting')
-        active = False
+def start_data_forwarding(sock, pre_mirror=False):
+    while True:
+        s, c = accept(sock, pre_mirror)
+        if s and c:
+            Connection(s, c, pre_mirror)
+
+
+def create_main_socket(port):
+    main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    log.info('Start listening for incoming connections on port %d...' % port)
+    main_sock.bind(('0.0.0.0', port))
+    main_sock.listen(128)
+    return main_sock
 
 
 def main():
-    main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    log.info('Start listening for incoming connections...')
-    main_sock.bind(('localhost', 1234))
-    main_sock.listen(128)
-    #  main_sock.setblocking(False)
+    port = 1234
+    main_sock = create_main_socket(port)
+    mirror_sock = create_main_socket(port+2)
 
-    start_data_forwarding(main_sock)
+    threading.Thread(
+        target=start_data_forwarding,
+        args=(main_sock, True),
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=start_data_forwarding,
+        args=(mirror_sock,),
+        daemon=True
+    ).start()
+
+    try:
+        subprocess.run(['./pcap-mirror.sh', '%d' % (port+1)])
+    except KeyboardInterrupt:
+        print('\r', end='')  # prevent '^C' on console
+        log.info('Caught Ctrl-C, exiting')

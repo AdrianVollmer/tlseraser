@@ -13,9 +13,10 @@ inport=$1
 outport=$((inport+1))
 netns=lg
 subnet=192.168.253
+devname=noTLS
 
 function finish {
-    ip link del veth-b
+    # ip link del $devname-a
     ip netns del $netns
 }
 trap finish EXIT
@@ -23,18 +24,18 @@ trap finish EXIT
 # create a test network namespace:
 ip netns add $netns
 
-# create a pair of virtual network interfaces (veth-a and veth-b):
-ip link add veth-a type veth peer name veth-b
+# create a pair of virtual network interfaces ($devname-a and $devname-b):
+ip link add $devname-a type veth peer name $devname-b
 
-# change the active namespace of the veth-a interface:
-ip link set veth-a netns $netns
+# change the active namespace of the $devname-a interface:
+ip link set $devname-a netns $netns
 
 # configure the IP addresses of the virtual interfaces:
-ip netns exec $netns ifconfig veth-a up $subnet.1 netmask 255.255.255.0
-ifconfig veth-b up $subnet.254 netmask 255.255.255.0
+ip netns exec $netns ifconfig $devname-a up $subnet.1 netmask 255.255.255.0
+ifconfig $devname-b up $subnet.254 netmask 255.255.255.0
 
 # configure the routing in the test namespace:
-ip netns exec $netns route add default gw $subnet.254 dev veth-a
+ip netns exec $netns route add default gw $subnet.254 dev $devname-a
 
 # run the network mirror
 ip netns exec $netns socat TCP-LISTEN:$inport,bind=$subnet.1,fork,reuseaddr TCP:$subnet.254:$outport
