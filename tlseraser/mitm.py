@@ -150,7 +150,6 @@ class Connection(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
-        # create new sockets
         self.server_sock = self.tlsify_server(self.server_sock)
         srv = connections[self.marker][False]
         srv.client_sock = srv.tlsify_client(srv.client_sock)
@@ -159,6 +158,7 @@ class Connection(threading.Thread):
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
+        # TODO fake cert
         #  cert = ssl.get_server_certificate(self.client_sock.getpeername())
         #  certfile = self.clone_cert(cert)
         return ssl.wrap_socket(conn,
@@ -212,15 +212,17 @@ def accept(sock, pre_mirror=False):
     if pre_mirror:
         other_conn = open_connection('192.168.253.1', 1235)
         now = datetime.now()
+        # send a marker first so we can link the connections
         marker = (now.day * 24 * 60 * 60 + now.second) * 10**6 \
             + now.microsecond
         marker = struct.pack("l", marker)
         other_conn.send(marker)
     else:
-        # TODO ip for debugging
+        # receive the marker first
         r, _, _ = select.select([conn], [], [], 5)
         if r:
             marker = conn.recv(16)
+        # TODO ip for debugging
         other_conn = open_connection('127.0.0.2', 1235)
     log.debug('created connection pair (%x): %s, %s' %
               (int.from_bytes(marker, "big"), conn, other_conn))

@@ -1,4 +1,6 @@
 #!/bin/bash
+# this creates a "network mirror", for the sole reason of having a separate
+# network interface where we can see the clear text traffic
 # https://askubuntu.com/questions/11709/how-can-i-capture-network-traffic-of-a-single-process
 
 set -e
