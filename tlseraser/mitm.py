@@ -201,8 +201,8 @@ def accept(sock, pre_mirror=False):
     #  try:
     if pre_mirror:
         other_conn = open_connection('192.168.253.1', 1235)
-        #  dst = struct.pack("!2xH4s8x", orig_port, orig_ip.encode())
-        #  other_conn.setsockopt(socket.SOL_IP, SO_ORIGINAL_DST, dst)
+        dst = struct.pack("!2xH4s8x", orig_port, orig_ip.encode())
+        other_conn.setsockopt(socket.SOL_IP, SO_ORIGINAL_DST, dst)
     else:
         # TODO ip for debugging
         other_conn = open_connection('127.0.0.2', 1235)
