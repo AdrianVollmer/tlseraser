@@ -20,11 +20,12 @@ class Connection(threading.Thread):
         super(Connection, self).__init__()
         self.server_sock = server_sock
         self.client_sock = client_sock
-        self.init_sockets()
         self.active = True
+        self.init_sockets()
         self.run()
 
     def init_sockets(self):
+        '''Initialize member variables'''
         self.read_socks = [self.server_sock, self.client_sock]
         self.write_socks = []
         self.buffers = {
@@ -33,17 +34,20 @@ class Connection(threading.Thread):
         }
 
     def peer_of(self, sock):
+        '''Get the other socket'''
         if sock == self.server_sock:
             return self.client_sock
         return self.server_sock
 
     def disconnect(self):
+        '''Disconnect everything'''
         self.active = False
         self.server_sock.close()
         self.client_sock.close()
         log.info('Disconnected')
 
     def run(self):
+        '''The main loop'''
         log.debug("Start loop")
         while self.active:
             try:
@@ -58,6 +62,7 @@ class Connection(threading.Thread):
             #      self.disconnect()
 
     def forward_data(self):
+        '''Move data from each socket to the other'''
         log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [])
         self.write_socks = []
@@ -67,6 +72,7 @@ class Connection(threading.Thread):
             self.write_to_sock(conn)
 
     def read_from_sock(self, conn):
+        '''Read data from a socket to a buffer'''
         log.debug("reading")
         try:
             if (not isinstance(conn, ssl.SSLSocket)
@@ -79,7 +85,7 @@ class Connection(threading.Thread):
             log.debug("Connection Reset: %s" % conn)
             self.disconnect()
         except ssl.SSLWantReadError:
-            # can be ignored
+            # can be ignored. data will be read next time
             return
         #  except OSError:
             #  log.info('connection reset by peer')
@@ -94,6 +100,7 @@ class Connection(threading.Thread):
             self.disconnect()
 
     def write_to_sock(self, conn):
+        '''Write data from a buffer to a socket'''
         log.debug('writing')
         data = self.buffers[self.peer_of(conn)]
         if data:
@@ -108,8 +115,9 @@ class Connection(threading.Thread):
                 self.write_socks.append(conn)
 
     def clear_peer_buffer(self, conn, c):
+        '''Clear buffer after data has been written to a socket'''
         self.buffers[self.peer_of(conn)] = \
-                self.buffers[self.peer_of(conn)][c:]
+            self.buffers[self.peer_of(conn)][c:]
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a

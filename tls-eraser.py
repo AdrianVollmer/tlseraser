@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from tlseraser.main import main
+from tlseraser.mitm import main
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
