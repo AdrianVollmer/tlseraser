@@ -11,21 +11,29 @@ import struct
 import ssl
 import subprocess
 import threading
-#  import time
+from datetime import datetime
 import logging
 log = logging.getLogger(__name__)
 
 SO_ORIGINAL_DST = 80
 
+# keep track of connections with markers
+connections = {}
+
 
 class Connection(threading.Thread):
-    def __init__(self, server_sock, client_sock, pre_mirror=False):
+    def __init__(self, server_sock, client_sock, marker, pre_mirror=False):
         super(Connection, self).__init__()
         self.server_sock = server_sock
         self.client_sock = client_sock
+        self.marker = marker
         self.pre_mirror = pre_mirror
         self.active = True
         self.init_sockets()
+        if marker in connections:
+            connections[marker][pre_mirror] = self
+        else:
+            connections[marker] = {pre_mirror: self}
         self.run()
 
     def init_sockets(self):
@@ -144,8 +152,10 @@ class Connection(threading.Thread):
         log.debug("Wrapping connection in TLS")
         # create new sockets
         self.server_sock = self.tlsify_server(self.server_sock)
-        self.client_sock = self.tlsify_client(self.client_sock)
+        srv = connections[self.marker][False]
+        srv.client_sock = srv.tlsify_client(srv.client_sock)
         self.init_sockets()
+        srv.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
@@ -174,7 +184,7 @@ class Connection(threading.Thread):
         )
 
 
-def original_dst(conn):
+def original_dst(conn, pre_mirror=False):
     '''Find original destination of an incoming connection'''
     original_dst = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
     original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
@@ -194,20 +204,27 @@ def open_connection(ip, port):
 def accept(sock, pre_mirror=False):
     '''Accept incoming connection and pair it with one to original dest'''
     conn, addr = sock.accept()  # Should be ready
-    orig_ip, orig_port = original_dst(conn)
+    orig_ip, orig_port = original_dst(conn, pre_mirror)
     log.info('accepted from %s:%d with original destination %s:%d' %
              (*addr, orig_ip, orig_port))
     conn.setblocking(False)
     #  try:
     if pre_mirror:
         other_conn = open_connection('192.168.253.1', 1235)
-        dst = struct.pack("!2xH4s8x", orig_port, orig_ip.encode())
-        other_conn.setsockopt(socket.SOL_IP, SO_ORIGINAL_DST, dst)
+        now = datetime.now()
+        marker = (now.day * 24 * 60 * 60 + now.second) * 10**6 \
+            + now.microsecond
+        marker = struct.pack("l", marker)
+        other_conn.send(marker)
     else:
         # TODO ip for debugging
+        r, _, _ = select.select([conn], [], [], 5)
+        if r:
+            marker = conn.recv(16)
         other_conn = open_connection('127.0.0.2', 1235)
-    log.debug('created connection pair: %s, %s' % (conn, other_conn))
-    return conn, other_conn
+    log.debug('created connection pair (%x): %s, %s' %
+              (int.from_bytes(marker, "big"), conn, other_conn))
+    return conn, other_conn, marker
     #  except Exception as e:
     #      log.error('error while opening connection to original destination:'
     #                ' %s' % e)
@@ -217,9 +234,9 @@ def accept(sock, pre_mirror=False):
 
 def start_data_forwarding(sock, pre_mirror=False):
     while True:
-        s, c = accept(sock, pre_mirror)
+        s, c, marker = accept(sock, pre_mirror)
         if s and c:
-            Connection(s, c, pre_mirror)
+            Connection(s, c, marker, pre_mirror)
 
 
 def create_main_socket(port):
