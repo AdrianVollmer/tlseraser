@@ -12,6 +12,7 @@ import ssl
 import subprocess
 import threading
 from datetime import datetime
+import time
 import logging
 log = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class Connection(threading.Thread):
                 self.forward_data()
             #  except (ssl.SSLError, ssl.SSLEOFError) as e:
             #      log.error("SSLError: %s" % str(e))
-            except (ConnectionResetError, OSError) as e:
+            except (ConnectionResetError) as e:
                 log.error("Connection lost (%s)" % str(e))
                 self.disconnect()
             #  except ValueError as e:
@@ -131,6 +132,11 @@ class Connection(threading.Thread):
         self.buffers[self.peer_of(conn)] = \
             self.buffers[self.peer_of(conn)][c:]
 
+    def get_post_mirror_connection(self):
+        while False not in connections[self.marker]:
+            time.sleep(.1)
+        return connections[self.marker][False]
+
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
         Client Hello'''
@@ -151,30 +157,32 @@ class Connection(threading.Thread):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
         self.server_sock = self.tlsify_server(self.server_sock)
-        srv = connections[self.marker][False]
+        srv = self.get_post_mirror_connection()
         srv.client_sock = srv.tlsify_client(srv.client_sock)
         self.init_sockets()
         srv.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
-        # TODO fake cert
-        #  cert = ssl.get_server_certificate(self.client_sock.getpeername())
-        #  certfile = self.clone_cert(cert)
+        #  certfile, keyfile = self.clone_cert()
+        certfile, keyfile = "mitm.pem mitm.key".split()
         return ssl.wrap_socket(conn,
                                server_side=True,
-                               certfile="mitm.pem",
-                               keyfile="mitm.key",
+                               certfile=certfile,
+                               keyfile=keyfile,
                                ssl_version=ssl.PROTOCOL_TLS,
                                do_handshake_on_connect=False,
                                )
 
-    def clone_cert(self, cert, CA_key=None):
+    def clone_cert(self, CA_key=None):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        # TODO
-        return "mitm.pem"
+        # TODO fake cert
+        srv = self.get_post_mirror_connection()
+        peer = srv.client_sock.getpeername()
+        fake_cert = subprocess.check_output(peer)
+        return fake_cert.split('\n')
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
