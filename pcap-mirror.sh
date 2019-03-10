@@ -12,7 +12,7 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 inport=$1
-outport=$((inport+1))
+outport=$inport
 netns=lg
 subnet=192.168.253
 devname=noTLS

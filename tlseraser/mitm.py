@@ -1,40 +1,66 @@
 """
-This module opens the main socket. Incoming connections are relayed to their
-original destination, assuming they have been DNATed.
+This module opens the main sockets. Incoming connections are relayed to
+a "socket mirror" and then to their original destination, assuming they have
+been DNATed. TLS is enabled as needed.
 
-TLS is enabled if necessary.
+The socket mirror runs in another network namespace and is used for the sole
+reason of having an interface that the clear text is running through to use
+with tcpdump.
+
+TODO:
+    - certificate cloning with compromised CA
+    - idea: instead of using markers, link streams by blocking new connections
 """
 
+import os
 import socket
 import select
 import struct
 import ssl
 import subprocess
 import threading
-from datetime import datetime
 import time
 import logging
 log = logging.getLogger(__name__)
 
 SO_ORIGINAL_DST = 80
 
-# keep track of connections with markers
-connections = {}
+ERASE_TLS = True  # streams must be linked for this to work
+LINK_STREAMS = True  # 'False' untested - TODO
+MARKER_LEN = 8
+LISTEN_PORT = 1234
+MIRROR_IP = ['192.168.253.1', 1235]
+TEST_SERVICE = ['127.0.0.2', 4444]
+
+# keep track of streams with markers
+streams = {}
 
 
-class Connection(threading.Thread):
-    def __init__(self, server_sock, client_sock, marker, pre_mirror=False):
-        super(Connection, self).__init__()
+class Stream(threading.Thread):
+    def __init__(self,
+                 server_sock,
+                 client_sock,
+                 marker,
+                 orig_dest,
+                 pre_mirror=False,
+                 ):
+        super(Stream, self).__init__()
         self.server_sock = server_sock
         self.client_sock = client_sock
         self.marker = marker
         self.pre_mirror = pre_mirror
+        self.marker_str = "%x-%d" % (
+            int.from_bytes(marker, "little"),
+            self.pre_mirror,
+        )
+        if self.pre_mirror:
+            self.orig_dest = orig_dest
         self.active = True
         self.init_sockets()
-        if marker in connections:
-            connections[marker][pre_mirror] = self
+        if marker in streams:
+            streams[marker][pre_mirror] = self
         else:
-            connections[marker] = {pre_mirror: self}
+            streams[marker] = {pre_mirror: self}
         self.run()
 
     def init_sockets(self):
@@ -52,16 +78,16 @@ class Connection(threading.Thread):
             return self.client_sock
         return self.server_sock
 
-    def disconnect(self):
+    def disconnect(self, recurse=True):
         '''Disconnect everything'''
         self.active = False
         self.server_sock.close()
         self.client_sock.close()
-        log.info('Disconnected')
+        log.info('[%s] Disconnected' % self.marker_str)
 
     def run(self):
         '''The main loop'''
-        log.debug("Start loop")
+        log.debug("[%s] Start loop" % self.marker_str)
         while self.active:
             try:
                 self.forward_data()
@@ -74,9 +100,16 @@ class Connection(threading.Thread):
             #      log.error(e)
             #      self.disconnect()
 
+    def should_starttls(self, conn):
+        '''Check if we want and can wrap the sockets in TLS now'''
+        return (ERASE_TLS
+                and not isinstance(conn, ssl.SSLSocket)
+                and self.got_client_hello(conn)
+                )
+
     def forward_data(self):
-        '''Move data from each socket to the other'''
-        log.debug('selecting sockets...')
+        '''Move data from one socket to the other'''
+        #  log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
         self.write_socks = []
         for conn in r:
@@ -86,10 +119,9 @@ class Connection(threading.Thread):
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
-        log.debug("reading")
+        #  log.debug("reading")
         try:
-            if (not isinstance(conn, ssl.SSLSocket)
-                    and self.got_client_hello(conn)):
+            if self.should_starttls(conn):
                 self.starttls()
                 return False
             else:
@@ -105,23 +137,23 @@ class Connection(threading.Thread):
             #  self.disconnect()
             #  return False
         if data:
-            log.debug('Read %d bytes' % len(data))
+            #  log.debug('Read %d bytes' % len(data))
             self.buffers[conn] += data
             self.write_socks.append(self.peer_of(conn))
         else:
-            log.info("Connection closed")
+            log.info("[%s] Connection closed" % self.marker_str)
             self.disconnect()
 
     def write_to_sock(self, conn):
         '''Write data from a buffer to a socket'''
-        log.debug('writing')
+        #  log.debug('writing')
         data = self.buffers[self.peer_of(conn)]
         if data:
             try:
                 c = conn.send(data)
                 if c:
                     self.clear_peer_buffer(conn, c)
-                    log.debug('Wrote %d byes' % c)
+                    #  log.debug('Wrote %d byes' % c)
             except ssl.SSLWantReadError:
                 # can be ignored
                 # re-add socket to write_socks though to re-try the write
@@ -132,10 +164,15 @@ class Connection(threading.Thread):
         self.buffers[self.peer_of(conn)] = \
             self.buffers[self.peer_of(conn)][c:]
 
-    def get_post_mirror_connection(self):
-        while False not in connections[self.marker]:
+    def get_paired_connection(self):
+        '''Return the paired connection that shares the same marker'''
+        if not LINK_STREAMS:
+            log.error("Connections are not linked, use LINK_STREAMS=True")
+            return None
+        other_conn = not self.pre_mirror
+        while other_conn not in streams[self.marker]:
             time.sleep(.1)
-        return connections[self.marker][False]
+        return streams[self.marker][other_conn]
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
@@ -156,16 +193,17 @@ class Connection(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
-        self.server_sock = self.tlsify_server(self.server_sock)
-        srv = self.get_post_mirror_connection()
-        srv.client_sock = srv.tlsify_client(srv.client_sock)
-        self.init_sockets()
-        srv.init_sockets()
+        srv = self.get_paired_connection()
+        if srv:
+            srv.client_sock = srv.tlsify_client(srv.client_sock)
+            self.server_sock = self.tlsify_server(self.server_sock)
+            self.init_sockets()
+            srv.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
-        #  certfile, keyfile = self.clone_cert()
-        certfile, keyfile = "mitm.pem mitm.key".split()
+        keyfile, certfile = self.clone_cert()
+        #  certfile, keyfile = "mitm.pem mitm.key".split()
         return ssl.wrap_socket(conn,
                                server_side=True,
                                certfile=certfile,
@@ -178,11 +216,16 @@ class Connection(threading.Thread):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        # TODO fake cert
-        srv = self.get_post_mirror_connection()
-        peer = srv.client_sock.getpeername()
-        fake_cert = subprocess.check_output(peer)
-        return fake_cert.split('\n')
+        log.debug("Retrieve original certificate and clone it")
+        srv = self.get_paired_connection()
+        peer = "%s:%d" % (srv.client_sock.getpeername())
+        if CA_key:
+            log.error("CA not yet implemented")
+            #  cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
+        else:
+            cmd = ["./clone-cert.sh", peer]
+        fake_cert = subprocess.check_output(cmd)
+        return fake_cert.split(b'\n')[:2]
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
@@ -209,6 +252,11 @@ def open_connection(ip, port):
     return sock
 
 
+def create_marker_id():
+    marker = os.urandom(MARKER_LEN)
+    return marker
+
+
 def accept(sock, pre_mirror=False):
     '''Accept incoming connection and pair it with one to original dest'''
     conn, addr = sock.accept()  # Should be ready
@@ -216,52 +264,49 @@ def accept(sock, pre_mirror=False):
     log.info('accepted from %s:%d with original destination %s:%d' %
              (*addr, orig_ip, orig_port))
     conn.setblocking(False)
-    #  try:
     if pre_mirror:
-        other_conn = open_connection('192.168.253.1', 1235)
-        now = datetime.now()
-        # send a marker first so we can link the connections
-        marker = (now.day * 24 * 60 * 60 + now.second) * 10**6 \
-            + now.microsecond
-        marker = struct.pack("l", marker)
+        other_conn = open_connection(*MIRROR_IP)
+        marker = create_marker_id()
         other_conn.send(marker)
     else:
         # receive the marker first
-        r, _, _ = select.select([conn], [], [], 5)
-        if r:
-            marker = conn.recv(16)
-        # TODO ip for debugging
-        other_conn = open_connection('127.0.0.2', 1235)
-    log.debug('created connection pair (%x): %s, %s' %
-              (int.from_bytes(marker, "big"), conn, other_conn))
-    return conn, other_conn, marker
-    #  except Exception as e:
-    #      log.error('error while opening connection to original destination:'
-    #                ' %s' % e)
-    #      conn.close()
-    #      return None, None
+        if LINK_STREAMS:
+            r, _, _ = select.select([conn], [], [], 5)
+            if r:
+                marker = conn.recv(MARKER_LEN)
+            else:
+                log.error("Mirrored connection not received")
+                return None, None, None
+        else:
+            marker = create_marker_id()
+        if TEST_SERVICE:  # for testing. can be removed
+            other_conn = open_connection(*TEST_SERVICE)
+        else:  # TODO untested
+            orig_dest = streams[marker][True].orig_dest
+            other_conn = open_connection(orig_dest)
+    log.debug('created connection pair [%x]: %s, %s' %
+              (int.from_bytes(marker, "little"), conn, other_conn))
+    Stream(conn, other_conn, marker, (orig_ip, orig_port), pre_mirror)
 
 
 def start_data_forwarding(sock, pre_mirror=False):
     while True:
-        s, c, marker = accept(sock, pre_mirror)
-        if s and c:
-            Connection(s, c, marker, pre_mirror)
+        accept(sock, pre_mirror)
 
 
-def create_main_socket(port):
+def create_main_socket(ip, port):
     main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     log.info('Start listening for incoming connections on port %d...' % port)
-    main_sock.bind(('0.0.0.0', port))
+    main_sock.bind((ip, port))
     main_sock.listen(128)
     return main_sock
 
 
 def main():
-    port = 1234
-    main_sock = create_main_socket(port)
-    mirror_sock = create_main_socket(port+2)
+    port = LISTEN_PORT
+    main_sock = create_main_socket('0.0.0.0', port)
+    mirror_sock = create_main_socket('0.0.0.0', port+1)
 
     threading.Thread(
         target=start_data_forwarding,
