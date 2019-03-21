@@ -26,15 +26,15 @@ trap finish EXIT
 # create a test network namespace:
 ip netns add $netns
 
-# create a pair of virtual network interfaces ($devname-a and $devname-b):
-ip link add $devname-a type veth peer name $devname-b
+# create a pair of virtual network interfaces ($devname-a and $devname):
+ip link add $devname-a type veth peer name $devname
 
 # change the active namespace of the $devname-a interface:
 ip link set $devname-a netns $netns
 
 # configure the IP addresses of the virtual interfaces:
 ip netns exec $netns ifconfig $devname-a up $subnet.1 netmask 255.255.255.0
-ifconfig $devname-b up $subnet.254 netmask 255.255.255.0
+ifconfig $devname up $subnet.254 netmask 255.255.255.0
 
 # configure the routing in the test namespace:
 ip netns exec $netns route add default gw $subnet.254 dev $devname-a

@@ -30,7 +30,11 @@ LINK_STREAMS = True  # 'False' untested - TODO
 MARKER_LEN = 8
 LISTEN_PORT = 1234
 MIRROR_IP = ['192.168.253.1', 1235]
-TEST_SERVICE = ['127.0.0.2', 4444]
+TEST_SERVICE = ['37.202.2.212', 443]
+
+# If one end is performing the TLS handshake, we need to pause the data
+# forwarding or the sockets will get mixed up
+WAIT_FOR_HANDSHAKE = False
 
 # keep track of streams with markers
 streams = {}
@@ -81,8 +85,6 @@ class Stream(threading.Thread):
     def disconnect(self, recurse=True):
         '''Disconnect everything'''
         self.active = False
-        self.server_sock.close()
-        self.client_sock.close()
         log.info('[%s] Disconnected' % self.marker_str)
 
     def run(self):
@@ -90,7 +92,10 @@ class Stream(threading.Thread):
         log.debug("[%s] Start loop" % self.marker_str)
         while self.active:
             try:
-                self.forward_data()
+                if WAIT_FOR_HANDSHAKE and not self.pre_mirror:
+                    time.sleep(.1)
+                else:
+                    self.forward_data()
             #  except (ssl.SSLError, ssl.SSLEOFError) as e:
             #      log.error("SSLError: %s" % str(e))
             except (ConnectionResetError) as e:
@@ -102,7 +107,12 @@ class Stream(threading.Thread):
 
     def should_starttls(self, conn):
         '''Check if we want and can wrap the sockets in TLS now'''
+        if self.pre_mirror:
+            test_socket = self.server_sock
+        else:
+            test_socket = self.client_sock
         return (ERASE_TLS
+                and conn == test_socket
                 and not isinstance(conn, ssl.SSLSocket)
                 and self.got_client_hello(conn)
                 )
@@ -113,29 +123,35 @@ class Stream(threading.Thread):
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
         self.write_socks = []
         for conn in r:
-            self.read_from_sock(conn)
+            if conn.fileno() > 0:
+                self.read_from_sock(conn)
         for conn in w:
-            self.write_to_sock(conn)
+            if conn.fileno() > 0:
+                self.write_to_sock(conn)
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
         #  log.debug("reading")
+        global WAIT_FOR_HANDSHAKE
         try:
             if self.should_starttls(conn):
+                WAIT_FOR_HANDSHAKE = True
                 self.starttls()
-                return False
+                WAIT_FOR_HANDSHAKE = False
+                return
             else:
                 data = conn.recv(1000)
         except ConnectionResetError:
             log.debug("Connection Reset: %s" % conn)
             self.disconnect()
+            return
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return
         #  except OSError:
-            #  log.info('connection reset by peer')
-            #  self.disconnect()
-            #  return False
+        #      log.info('connection reset by peer')
+        #      self.disconnect()
+        #      return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
             self.buffers[conn] += data
@@ -158,11 +174,13 @@ class Stream(threading.Thread):
                 # can be ignored
                 # re-add socket to write_socks though to re-try the write
                 self.write_socks.append(conn)
+            except OSError as e:
+                log.error(str(e))
 
     def clear_peer_buffer(self, conn, c):
         '''Clear buffer after data has been written to a socket'''
-        self.buffers[self.peer_of(conn)] = \
-            self.buffers[self.peer_of(conn)][c:]
+        peer = self.peer_of(conn)
+        self.buffers[peer] = self.buffers[peer][c:]
 
     def get_paired_connection(self):
         '''Return the paired connection that shares the same marker'''
@@ -193,12 +211,14 @@ class Stream(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
-        srv = self.get_paired_connection()
-        if srv:
-            srv.client_sock = srv.tlsify_client(srv.client_sock)
+        peer = self.get_paired_connection()
+        if peer:
+            peer.client_sock = peer.tlsify_client(peer.client_sock)
             self.server_sock = self.tlsify_server(self.server_sock)
+            do_tls_handshake(peer.client_sock)
+            do_tls_handshake(self.server_sock)
             self.init_sockets()
-            srv.init_sockets()
+            peer.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
@@ -231,6 +251,7 @@ class Stream(threading.Thread):
         '''Wrap an outgoing connection inside TLS'''
         return ssl.wrap_socket(
             conn,
+            ssl_version=ssl.PROTOCOL_TLS,
             do_handshake_on_connect=False,
         )
 
@@ -287,6 +308,20 @@ def accept(sock, pre_mirror=False):
     log.debug('created connection pair [%x]: %s, %s' %
               (int.from_bytes(marker, "little"), conn, other_conn))
     Stream(conn, other_conn, marker, (orig_ip, orig_port), pre_mirror)
+
+
+def do_tls_handshake(s):
+    while True:
+        try:
+            s.do_handshake()
+            break
+        except ssl.SSLError as err:
+            if err.args[0] == ssl.SSL_ERROR_WANT_READ:
+                select.select([s], [], [])
+            elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
+                select.select([], [s], [])
+            else:
+                raise
 
 
 def start_data_forwarding(sock, pre_mirror=False):
