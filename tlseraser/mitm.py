@@ -148,6 +148,8 @@ class Stream(threading.Thread):
             log.debug("Connection Reset: %s" % conn)
             self.disconnect()
             return
+        except ssl.SSLError as e:
+            log.error(str(e))
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return
