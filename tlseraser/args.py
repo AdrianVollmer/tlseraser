@@ -35,6 +35,14 @@ parser.add_argument(
          "(default: 192.168.253.1:1235)"
 )
 
+parser.add_argument(
+    '--testing',
+    dest="TESTING",
+    default=False,
+    action='store_true',
+    help='for testing purposes only',
+)
+
 
 args = parser.parse_args()
 

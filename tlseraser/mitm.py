@@ -30,7 +30,10 @@ LINK_STREAMS = True  # 'False' untested - TODO
 MARKER_LEN = 8
 LISTEN_PORT = args.LPORT
 MIRROR_IP = [args.M_LHOST, args.M_LPORT]
-TEST_SERVICE = ['37.202.2.212', 443]
+if args.TESTING:
+    TEST_SERVICE = ['185.142.184.67', 443]
+else:
+    TEST_SERVICE = None
 
 # If one end is performing the TLS handshake, we need to pause the data
 # forwarding or the sockets will get mixed up
