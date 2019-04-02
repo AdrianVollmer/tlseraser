@@ -8,10 +8,10 @@ reason of having an interface that the clear text is running through to use
 with tcpdump.
 
 TODO:
-    - certificate cloning with compromised CA
     - idea: instead of using markers, link streams by blocking new connections
 """
 
+from tlseraser.args import args
 import os
 import socket
 import select
@@ -28,8 +28,8 @@ SO_ORIGINAL_DST = 80
 ERASE_TLS = True  # streams must be linked for this to work
 LINK_STREAMS = True  # 'False' untested - TODO
 MARKER_LEN = 8
-LISTEN_PORT = 1234
-MIRROR_IP = ['192.168.253.1', 1235]
+LISTEN_PORT = args.LPORT
+MIRROR_IP = [args.M_LHOST, args.M_LPORT]
 TEST_SERVICE = ['37.202.2.212', 443]
 
 # If one end is performing the TLS handshake, we need to pause the data
