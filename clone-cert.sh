@@ -5,28 +5,106 @@
 
 set -e
 
-HOST="$1"
-
-if [[ -f "$HOST" ]] ; then
-    FILENAME="$(basename "$HOST")"
-else
-    SERVER="$(printf "%s" "$HOST" | cut -f1 -d:)"
-fi
-
-DIR="/tmp/"
-KEYLENGTH=1024 # 1024 is faster, but less secure than 4096
+DIR="/tmp"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-if [ "$HOST" = "" ] ; then
+if [ "$1" = "" ] ; then
 cat <<EOF
-Clone an X509 certificate. The forged certificate and the corresponding key
+Usage: $0 <host>:<port>|<pem-file> [<subject> <key>]
+
+Clone an X509 certificate. The cloned certificate and the corresponding key
 will be located in $DIR. Their filenames make up the output of this script.
 
-Usage: $0 <host>:<port>|<pem-file>
+As optional parameters, you can specifiy the distinguished name of the
+subject of a certificate and the corresponding private key in PEM format.
+This script will clone all certificates in the chain below the compromised
+one. The subject must match the form as in 'openssl x509 -noout -subject',
+but without the 'subject=' string.
+
+If none of the certificates in the chain have a subject name that matches
+the one of the certificate that you control, the subject of the cloned host
+certificate will be changed accordingly and it is assumed that your
+certificate is a trust anchor.
 EOF
     exit 1
 fi
 
+# set some variables
+HOST="$1"
+COMPROMISED_CA="$2"
+COMPROMISED_KEY="$3"
+
+if [[ ! -z $COMPROMISED_KEY ]] ; then
+    if [[ ! -f $COMPROMISED_KEY ]] ; then
+        echo "File not found: $COMPROMISED_KEY" >&2
+        exit 1
+    fi
+fi
+
+set -u
+
+if [[ -f "$HOST" ]] ; then
+    CERTNAME="$(basename "$HOST")"
+else
+    SERVER="$(printf "%s" "$HOST" | cut -f1 -d:)"
+    CERTNAME="$HOST"
+fi
+rm -f "$DIR/${CERTNAME}_"*
+
+function generate_key () {
+    # create new private/public key pair (re-use private key if applicable)
+    local KEY_LEN="$1"
+    local MY_PRIV_KEY="$2"
+
+    # TODO support DSA, EC
+    openssl genrsa -out "$MY_PRIV_KEY" "$KEY_LEN" 2> /dev/null
+
+    NEW_MODULUS="$(openssl rsa -in "$MY_PRIV_KEY" -pubout 2> /dev/null \
+        | openssl rsa -pubin -noout -modulus \
+        | sed 's/Modulus=//' | tr "[:upper:]" "[:lower:]" )"
+    printf "%s" "$NEW_MODULUS"
+}
+
+function parse_certs () {
+    # read the output of s_client via stdin and clone each cert
+    # from https://stackoverflow.com/questions/45243785/script-wrapper-for-openssl-which-will-download-an-entire-certificate-chain-and
+    nl=$'\n'
+
+    state=begin
+    counter=0
+    while IFS= read -r line ; do
+        case "$state;$line" in
+          "begin;-----BEGIN CERTIFICATE-----" )
+            # A certificate is about to begin!
+            state=reading
+            current_cert="$line"
+            ;;
+
+          "reading;-----END CERTIFICATE-----" )
+            # Last line of a cert; save it and get ready for the next
+            current_cert+="${current_cert:+$nl}$line"
+
+            # ...and save it
+            printf "%s" "$current_cert" > "$DIR/${CERTNAME}_$counter"
+            counter=$((counter+=1))
+
+            # no need to clone the other certs if we have no compromised CA
+            if [[ -z $COMPROMISED_CA ]] ; then
+                break
+            fi
+
+            state=begin
+            current_cert=""
+            ;;
+
+          "reading;"* )
+            # Otherwise, it's a normal part of a cert; accumulate it to be
+            # written out when we see the end
+            current_cert+="$nl$line"
+            ;;
+        esac
+    done
+}
 
 function oid() {
     # https://bugzil.la/1064636
@@ -41,7 +119,7 @@ function oid() {
         ;;#sha384WithRSAEncryption
         "300a06082a8648ce3d040303") echo "ECDSA not supported" >&2; exit 1
         ;;#ecdsa-with-SHA384
-        "300a06082a8648ce3d040302") "ECDSA not supported" >&2; exit 1
+        "300a06082a8648ce3d040302") echo "ECDSA not supported" >&2; exit 1
         ;;#ecdsa-with-SHA256
         "300d06092a864886f70d0101040500") echo md5
         ;;#md5WithRSAEncryption
@@ -57,64 +135,119 @@ function oid() {
     esac
 }
 
-if [[ -f "$HOST" ]] ; then
-    CLONED_CERT_FILE="$DIR$FILENAME.cert"
-    CLONED_KEY_FILE="$DIR$FILENAME.key"
-else
-    CLONED_CERT_FILE="$DIR$HOST.cert"
-    CLONED_KEY_FILE="$DIR$HOST.key"
-fi
-ORIG_CERT_FILE="$CLONED_CERT_FILE.orig"
+
+function hexlify(){
+    xxd -p | tr -d '\n'
+}
+
+function unhexlify(){
+    xxd -p -r
+}
 
 
+function clone_cert () {
+    local CERT_FILE="$1"
+    local ISSUING_KEY="$2"
+    SUBJECT="$(openssl x509 -in "$CERT_FILE" -noout -subject \
+        | sed 's/.* CN = //g')"
+    ISSUER="$(openssl x509 -in "$CERT_FILE" -noout -issuer \
+        | sed 's/.* CN = //g')"
+
+    # if it is not self-signed and we have no compromised CA, change the
+    # issuer or no browser will allow an exception
+    # it needs to stay the same length though
+    if [[ ! -f $ISSUING_KEY ]] && [[ $ISSUER != $SUBJECT ]]; then
+        if [[ $ISSUER =~ I ]] ; then
+            NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/I/l/")
+        elif [[ $ISSUER =~ l ]] ; then
+            NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/l/I/")
+        elif [[ $ISSUER =~ O ]] ; then
+            NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/O/0/")
+        elif [[ $ISSUER =~ 0 ]] ; then
+            NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/0/O/")
+        else
+            NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/.$/ /")
+        fi
+    else
+        NEW_ISSUER=$ISSUER
+    fi
+    ISSUER=$(printf "%s" "$ISSUER" | hexlify)
+    NEW_ISSUER=$(printf "%s" "$NEW_ISSUER" | hexlify)
+    CLONED_CERT_FILE="${CERT_FILE}.cert"
+    CLONED_KEY_FILE="${CERT_FILE}.key"
+
+
+    OLD_MODULUS="$(openssl x509 -in "$CERT_FILE" -modulus -noout \
+        | sed -e 's/Modulus=//' | tr "[:upper:]" "[:lower:]")"
+    KEY_LEN="$(openssl x509  -in "$CERT_FILE" -noout -text \
+        | grep Public-Key: | grep -o "[0-9]\+")"
+
+    NEW_MODULUS="$(generate_key "$KEY_LEN" "$CLONED_KEY_FILE")"
+
+    # extract old signature
+    offset="$(openssl asn1parse -in "$CERT_FILE" | grep SEQUENCE \
+        | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/' | head -n1)"
+    SIGNING_ALGO="$(openssl asn1parse -in "$CERT_FILE" \
+        -strparse $offset -noout -out >(hexlify))"
+    offset="$(openssl asn1parse -in "$CERT_FILE" \
+        | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/' | head -n1)"
+    OLD_SIGNATURE="$(openssl asn1parse -in "$CERT_FILE" \
+        -strparse $offset -noout -out >(hexlify))"
+    OLD_TBS_CERTIFICATE="$(openssl asn1parse -in "$CERT_FILE" \
+        -strparse 4 -noout -out >(hexlify))"
+
+    OLD_TBS_CERTIFICATE="$(printf "%s" "$OLD_TBS_CERTIFICATE" \
+        | sed "s/$ISSUER/$NEW_ISSUER/")"
+    # create new signature
+    NEW_TBS_CERTIFICATE="$(printf "%s" "$OLD_TBS_CERTIFICATE" \
+        | sed "s/$OLD_MODULUS/$NEW_MODULUS/")"
+
+    digest="$(oid "$SIGNING_ALGO")"
+    if [[ -f $ISSUING_KEY ]] ; then
+        SIGNING_KEY="$ISSUING_KEY"
+    else
+        SIGNING_KEY="$CLONED_KEY_FILE"
+    fi
+    NEW_SIGNATURE="$(printf "%s" "$NEW_TBS_CERTIFICATE" | unhexlify \
+        | openssl dgst -$digest -sign "$SIGNING_KEY" | hexlify)"
+
+    # replace signature
+    openssl x509 -in "$CERT_FILE" -outform DER | hexlify \
+        | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
+        | sed "s/$ISSUER/$NEW_ISSUER/" \
+        | sed "s/$OLD_SIGNATURE/$NEW_SIGNATURE/" | unhexlify \
+        | openssl x509 -inform DER -outform PEM > "$CLONED_CERT_FILE"
+    printf "%s\n" "$CLONED_KEY_FILE"
+    printf "%s\n" "$CLONED_CERT_FILE"
+}
+
+
+# save all certificates in chain
 if [[ -f "$HOST" ]] ; then
-    cp "$HOST" "$ORIG_CERT_FILE"
+    cat "$HOST" | parse_certs
 else
     openssl s_client -servername "$SERVER" \
-        -connect "$HOST" < /dev/null 2>&1 | \
-        openssl x509 -outform PEM -out "$ORIG_CERT_FILE"
+        -showcerts -connect "$HOST" < /dev/null 2>/dev/null | \
+        parse_certs
 fi
 
-OLD_MODULUS="$(openssl x509 -in "$ORIG_CERT_FILE" -modulus -noout \
-    | sed -e 's/Modulus=//' | tr "[:upper:]" "[:lower:]")"
-KEY_LEN="$(openssl x509  -in "$ORIG_CERT_FILE" -noout -text \
-    | grep Public-Key: | grep -o "[0-9]\+")"
-
-
-MY_PRIV_KEY="$DIR$HOST.$KEY_LEN.key"
-MY_PUBL_KEY="$DIR$HOST.$KEY_LEN.cert"
-
-offset="$(openssl asn1parse -in "$ORIG_CERT_FILE" | grep SEQUENCE \
-    | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/' | head -n1)"
-SIGNING_ALGO="$(openssl asn1parse -in "$ORIG_CERT_FILE" \
-    -strparse $offset -noout -out >(xxd -p -c99999))"
-offset="$(openssl asn1parse -in "$ORIG_CERT_FILE" \
-    | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/' | head -n1)"
-OLD_SIGNATURE="$(openssl asn1parse -in "$ORIG_CERT_FILE" \
-    -strparse $offset -noout -out >(xxd -p -c999999))"
-OLD_TBS_CERTIFICATE="$(openssl asn1parse -in "$ORIG_CERT_FILE" \
-    -strparse 4 -noout -out >(xxd -p -c99999))"
-
-# TODO support DSA, EC
-openssl req -new -newkey rsa:$KEY_LEN -days 356 -nodes -x509 \
-        -subj "/C=XX" -keyout "$MY_PRIV_KEY" -out "$MY_PUBL_KEY" \
-        2> /dev/null
-
-NEW_MODULUS="$(openssl x509 -in "$MY_PUBL_KEY" -noout -modulus \
-    | sed 's/Modulus=//' | tr "[:upper:]" "[:lower:]")"
-NEW_TBS_CERTIFICATE="$(printf "%s" "$OLD_TBS_CERTIFICATE" \
-    | sed "s/$OLD_MODULUS/$NEW_MODULUS/")"
-
-digest="$(oid "$SIGNING_ALGO")"
-NEW_SIGNATURE="$(printf "%s" "$NEW_TBS_CERTIFICATE" | xxd -p -r | \
-    openssl dgst -$digest -sign "$MY_PRIV_KEY" | xxd -p -c99999)"
-
-openssl x509 -in "$ORIG_CERT_FILE" -outform DER | xxd -p -c99999 \
-    | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
-    | sed "s/$OLD_SIGNATURE/$NEW_SIGNATURE/" | xxd -r -p \
-    | openssl x509 -inform DER -outform PEM > "$CLONED_CERT_FILE"
-
-cp "$MY_PRIV_KEY" "$CLONED_KEY_FILE"
-chmod 644 "$CLONED_KEY_FILE"
-printf "%s\n" "$CLONED_KEY_FILE"
-printf "%s\n" "$CLONED_CERT_FILE"
+# clone them
+for certfile in `ls -r "$DIR/${CERTNAME}_"*` ; do
+    CERT="$(cat $certfile)"
+    number="${certfile##*_}"
+    signing_key="${certfile%_*}_((number+1)).key"
+    if [[ -f $COMPROMISED_KEY ]] ; then
+        ISSUER="$(openssl x509 -in "$certfile" -noout -issuer | sed 's/^issuer=//')"
+        if [[ $ISSUER == $COMPROMISED_CA ]] ; then
+            clone_cert "$certfile" "$COMPROMISED_KEY"
+        else
+            if [[ -f "$signing_key" ]] ; then
+                clone_cert "$certfile" "$signing_key"
+            fi
+        fi
+    else
+        if [[ $number == "0" ]] ; then
+            clone_cert "$certfile" ""
+        fi
+    fi
+done
