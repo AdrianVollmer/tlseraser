@@ -64,6 +64,7 @@ class Stream(threading.Thread):
             self.orig_dest = orig_dest
         self.active = True
         self.init_sockets()
+        self.key_cert = None
         if marker in streams:
             streams[marker][pre_mirror] = self
         else:
@@ -145,20 +146,20 @@ class Stream(threading.Thread):
             else:
                 data = conn.recv(1000)
         except ConnectionResetError:
-            log.debug("Connection Reset: %s" % conn)
+            log.debug("Connection reset: %s" % conn)
             self.disconnect()
             return
         except ssl.SSLError as e:
             log.error(str(e))
-            self.disconnect()
+            #  self.disconnect()
             return
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return
-        #  except OSError:
-        #      log.info('connection reset by peer')
-        #      self.disconnect()
-        #      return False
+        except OSError:
+            log.info('[%s] Connection reset by peer' % self.marker_str)
+            self.disconnect()
+            return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
             self.buffers[conn] += data
@@ -195,8 +196,11 @@ class Stream(threading.Thread):
             log.error("Connections are not linked, use LINK_STREAMS=True")
             return None
         other_conn = not self.pre_mirror
-        while other_conn not in streams[self.marker]:
-            time.sleep(.1)
+        if other_conn not in streams[self.marker]:
+            log.warning("[%s] Paired connection not ready" %
+                        self.marker_str)
+            while other_conn not in streams[self.marker]:
+                time.sleep(.1)
         return streams[self.marker][other_conn]
 
     def got_client_hello(self, sock):
@@ -222,6 +226,7 @@ class Stream(threading.Thread):
         if peer:
             peer.client_sock = peer.tlsify_client(peer.client_sock)
             self.server_sock = self.tlsify_server(self.server_sock)
+            log.debug("Perform TLS handshakes")
             do_tls_handshake(peer.client_sock)
             do_tls_handshake(self.server_sock)
             self.init_sockets()
@@ -229,7 +234,9 @@ class Stream(threading.Thread):
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
-        keyfile, certfile = self.clone_cert()
+        keyfile, certfile = self.get_cached_cert()
+        if not (keyfile and certfile):
+            keyfile, certfile = self.clone_cert()
         #  certfile, keyfile = "mitm.pem mitm.key".split()
         return ssl.wrap_socket(conn,
                                server_side=True,
@@ -258,6 +265,19 @@ class Stream(threading.Thread):
             log.error("%s - %s" % (str(e), e.stdout.decode()))
             return None
         return fake_cert.split(b'\n')[:2]
+
+    def get_cached_cert(self):
+        '''Returns a cached certificate. Result is 'None, None' if it hasn't
+        been cached yet'''
+        srv = self.get_paired_connection()
+        peer = "%s:%d" % (srv.client_sock.getpeername())
+        cert_filename = os.path.join('/tmp/', '%s_0' % peer)
+        key_filename = cert_filename + '.key'
+        cert_filename = cert_filename + '.cert'
+        if os.path.exists(cert_filename) and os.path.exists(key_filename):
+            log.debug("Get cached certificate for %s" % peer)
+            return key_filename, cert_filename
+        return None, None
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
