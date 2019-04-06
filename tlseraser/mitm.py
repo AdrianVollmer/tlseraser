@@ -150,6 +150,8 @@ class Stream(threading.Thread):
             return
         except ssl.SSLError as e:
             log.error(str(e))
+            self.disconnect()
+            return
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return
@@ -249,7 +251,12 @@ class Stream(threading.Thread):
             #  cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
         else:
             cmd = ["./clone-cert.sh", peer]
-        fake_cert = subprocess.check_output(cmd)
+        try:
+            fake_cert = subprocess.check_output(cmd,
+                                                stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            log.error("%s - %s" % (str(e), e.stdout.decode()))
+            return None
         return fake_cert.split(b'\n')[:2]
 
     def tlsify_client(self, conn):
