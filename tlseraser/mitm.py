@@ -13,6 +13,7 @@ TODO:
 
 from tlseraser.args import args
 import os
+import sys
 import socket
 import select
 import struct
@@ -31,7 +32,7 @@ MARKER_LEN = 8
 LISTEN_PORT = args.LPORT
 MIRROR_IP = [args.M_LHOST, args.M_LPORT]
 if args.TESTING:
-    TEST_SERVICE = ['185.142.184.67', 443]
+    TEST_SERVICE = ['ptav.sy.gs', 443]
 else:
     TEST_SERVICE = None
 
@@ -90,21 +91,23 @@ class Stream(threading.Thread):
         '''Disconnect everything'''
         self.active = False
         log.info('[%s] Disconnected' % self.marker_str)
+        if self.marker in streams:
+            del streams[self.marker]
 
     def run(self):
         '''The main loop'''
         log.debug("[%s] Start loop" % self.marker_str)
         while self.active:
-            try:
-                if WAIT_FOR_HANDSHAKE and not self.pre_mirror:
-                    time.sleep(.1)
-                else:
-                    self.forward_data()
+            #  try:
+            if WAIT_FOR_HANDSHAKE and not self.pre_mirror:
+                time.sleep(.1)
+            else:
+                self.forward_data()
             #  except (ssl.SSLError, ssl.SSLEOFError) as e:
             #      log.error("SSLError: %s" % str(e))
-            except (ConnectionResetError) as e:
-                log.error("Connection lost (%s)" % str(e))
-                self.disconnect()
+            #  except (ConnectionResetError) as e:
+            #      log.error("Connection lost (%s)" % str(e))
+            #      self.disconnect()
             #  except ValueError as e:
             #      log.error(e)
             #      self.disconnect()
@@ -257,7 +260,7 @@ class Stream(threading.Thread):
             log.error("CA not yet implemented")
             #  cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
         else:
-            cmd = ["./clone-cert.sh", peer]
+            cmd = [os.path.join(sys.path[0], "clone-cert.sh"), peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
@@ -388,7 +391,8 @@ def main():
     ).start()
 
     try:
-        subprocess.run(['./pcap-mirror.sh', '%d' % (port+1)])
+        subprocess.run([os.path.join(sys.path[0], 'pcap-mirror.sh'),
+                        '%d' % (port+1)])
     except KeyboardInterrupt:
         print('\r', end='')  # prevent '^C' on console
         log.info('Caught Ctrl-C, exiting')
