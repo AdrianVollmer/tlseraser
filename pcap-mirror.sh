@@ -13,7 +13,7 @@ fi
 
 inport=$1
 outport=$inport
-netns=lg
+netns=mirror
 subnet=192.168.253
 devname=noTLS
 
