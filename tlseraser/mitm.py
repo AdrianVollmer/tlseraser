@@ -7,9 +7,6 @@ The socket mirror runs in another network namespace and is used for the sole
 reason of having an interface that the clear text is running through to use
 with tcpdump.
 
-TODO:
-    - idea: instead of using markers, link streams by blocking new connections
-
 """
 
 #                 S1  S2            S5  S6
@@ -34,6 +31,7 @@ import struct
 import ssl
 import subprocess
 import netns
+import random
 import threading
 import time
 import logging
@@ -61,63 +59,59 @@ NETNS = 'mirror'
 # forwarding or the sockets will get mixed up
 WAIT_FOR_HANDSHAKE = False
 
-# keep track of streams with markers
-streams = {}
+
+class ThreadWithReturnValue(threading.Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, Verbose=None, daemon=True):
+        threading.Thread.__init__(self, group, target, name, args, kwargs,
+                                  daemon=daemon)
+        self._return = None
+
+    def run(self):
+        if self._target is not None:
+            self._return = self._target(*self._args,
+                                        **self._kwargs)
+
+    def join(self, *args):
+        threading.Thread.join(self, *args)
+        return self._return
 
 
-class Stream(threading.Thread):
-    def __init__(self,
-                 server_sock,
-                 client_sock,
-                 marker,
-                 orig_dest,
-                 pre_mirror=False,
-                 ):
-        super(Stream, self).__init__()
-        self.server_sock = server_sock
-        self.client_sock = client_sock
-        self.marker = marker
-        self.pre_mirror = pre_mirror
-        self.marker_str = "%x-%d" % (
-            int.from_bytes(marker, "little"),
-            self.pre_mirror,
-        )
-        if self.pre_mirror:
-            self.orig_dest = orig_dest
+class Forwarder(threading.Thread):
+    def __init__(self, sockets):
+        super(Forwarder, self).__init__()
+        self.sockets = sockets
+        self.id = "%08x" % random.randint(0, 2**32)
         self.active = True
         self.init_sockets()
         self.key_cert = None
-        if marker in streams:
-            streams[marker][pre_mirror] = self
-        else:
-            streams[marker] = {pre_mirror: self}
-        self.run()
 
     def init_sockets(self):
         '''Initialize member variables'''
-        self.read_socks = [self.server_sock, self.client_sock]
-        self.write_socks = []
-        self.buffers = {
-            self.server_sock: b"",
-            self.client_sock: b"",
+        self.buffer = {}
+        for s in self.sockets:
+            self.buffer[s] = b''
+        self.peer = {
+            self.sockets[0]: self.sockets[1],
+            self.sockets[1]: self.sockets[0],
+            self.sockets[2]: self.sockets[3],
+            self.sockets[3]: self.sockets[2],
+            self.sockets[4]: self.sockets[5],
+            self.sockets[5]: self.sockets[4],
         }
+        self.read_socks = self.sockets
+        self.write_socks = []
 
-    def peer_of(self, sock):
-        '''Get the other socket'''
-        if sock == self.server_sock:
-            return self.client_sock
-        return self.server_sock
-
-    def disconnect(self, recurse=True):
-        '''Disconnect everything'''
+    def disconnect(self, conn):
+        '''Disconnect a socket and its peer'''
         self.active = False
-        log.info('[%s] Disconnected' % self.marker_str)
-        if self.marker in streams:
-            del streams[self.marker]
+        self.peer[conn].close()
+        self.read_socks.remove(conn)
+        self.read_socks.remove(self.peer[conn])
 
     def run(self):
         '''The main loop'''
-        log.debug("[%s] Start loop" % self.marker_str)
+        log.debug("[%s] Start loop" % self.id)
         while self.active:
             #  try:
             if WAIT_FOR_HANDSHAKE and not self.pre_mirror:
@@ -135,12 +129,8 @@ class Stream(threading.Thread):
 
     def should_starttls(self, conn):
         '''Check if we want and can wrap the sockets in TLS now'''
-        if self.pre_mirror:
-            test_socket = self.server_sock
-        else:
-            test_socket = self.client_sock
         return (ERASE_TLS
-                and conn == test_socket
+                and conn == self.sockets[0]
                 and not isinstance(conn, ssl.SSLSocket)
                 and self.got_client_hello(conn)
                 )
@@ -149,13 +139,11 @@ class Stream(threading.Thread):
         '''Move data from one socket to the other'''
         #  log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
+        for conn in w:
+            self.write_to_sock(conn)
         self.write_socks = []
         for conn in r:
-            if conn.fileno() > 0:
-                self.read_from_sock(conn)
-        for conn in w:
-            if conn.fileno() > 0:
-                self.write_to_sock(conn)
+            self.read_from_sock(conn)
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
@@ -168,64 +156,46 @@ class Stream(threading.Thread):
                 WAIT_FOR_HANDSHAKE = False
                 return
             else:
-                data = conn.recv(1000)
+                data = conn.recv(1024)
         except ConnectionResetError:
             log.debug("Connection reset: %s" % conn)
             self.disconnect()
             return
-        except ssl.SSLError as e:
-            log.error(str(e))
-            #  self.disconnect()
-            return
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return
+        except ssl.SSLError:
+            log.exception("Exception while reading")
+            #  self.disconnect()
+            return
         except OSError:
-            log.info('[%s] Connection reset by peer' % self.marker_str)
+            log.info('[%s] Connection reset by peer' % self.id)
             self.disconnect()
             return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
-            self.buffers[conn] += data
-            self.write_socks.append(self.peer_of(conn))
+            self.buffer[self.peer[conn]] += data
+            self.write_socks.append(self.peer[conn])
         else:
-            log.info("[%s] Connection closed" % self.marker_str)
-            self.disconnect()
+            log.info("[%s] Connection closed" % self.id)
+            self.disconnect(conn)
 
     def write_to_sock(self, conn):
         '''Write data from a buffer to a socket'''
         #  log.debug('writing')
-        data = self.buffers[self.peer_of(conn)]
+        data = self.buffer[conn]
         if data:
             try:
                 c = conn.send(data)
                 if c:
-                    self.clear_peer_buffer(conn, c)
+                    self.buffer[conn] = data[c:]
                     #  log.debug('Wrote %d byes' % c)
             except ssl.SSLWantReadError:
                 # can be ignored
                 # re-add socket to write_socks though to re-try the write
                 self.write_socks.append(conn)
-            except OSError as e:
-                log.error(str(e))
-
-    def clear_peer_buffer(self, conn, c):
-        '''Clear buffer after data has been written to a socket'''
-        peer = self.peer_of(conn)
-        self.buffers[peer] = self.buffers[peer][c:]
-
-    def get_paired_stream(self):
-        '''Return the paired stream that shares the same marker'''
-        if not LINK_STREAMS:
-            log.error("Connections are not linked, use LINK_STREAMS=True")
-            return None
-        other_conn = not self.pre_mirror
-        if other_conn not in streams[self.marker]:
-            log.warning("[%s] Paired stream not ready" %
-                        self.marker_str)
-            while other_conn not in streams[self.marker]:
-                time.sleep(.1)
-        return streams[self.marker][other_conn]
+            except OSError:
+                log.exception("Exception while writing")
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
@@ -246,15 +216,12 @@ class Stream(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
-        peer = self.get_paired_stream()
-        if peer:
-            peer.client_sock = peer.tlsify_client(peer.client_sock)
-            self.server_sock = self.tlsify_server(self.server_sock)
-            log.debug("Perform TLS handshakes")
-            do_tls_handshake(peer.client_sock)
-            do_tls_handshake(self.server_sock)
-            self.init_sockets()
-            peer.init_sockets()
+        log.debug("Perform TLS handshakes")
+        self.sockets[0] = self.tlsify_server(self.sockets[0])
+        self.sockets[5] = self.tlsify_client(self.sockets[5])
+        do_tls_handshake(self.sockets[0])
+        do_tls_handshake(self.sockets[5])
+        self.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
@@ -275,8 +242,8 @@ class Stream(threading.Thread):
 
         It will be self-signed unless the private key of a CA is given'''
         log.debug("Retrieve original certificate and clone it")
-        srv = self.get_paired_stream()
-        peer = "%s:%d" % (srv.client_sock.getpeername())
+        srv = self.sockets[5]
+        peer = "%s:%d" % (srv.getpeername())
         if CA_key:
             log.error("CA not yet implemented")
             #  cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
@@ -293,8 +260,8 @@ class Stream(threading.Thread):
     def get_cached_cert(self):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
-        srv = self.get_paired_stream()
-        peer = "%s:%d" % (srv.client_sock.getpeername())
+        srv = self.sockets[5]
+        peer = "%s:%d" % (srv.getpeername())
         cert_filename = os.path.join('/tmp/', '%s_0' % peer)
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
@@ -312,60 +279,6 @@ class Stream(threading.Thread):
         )
 
 
-def original_dst(conn, pre_mirror=False):
-    '''Find original destination of an incoming connection'''
-    original_dst = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
-    original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
-                                                       original_dst)
-    original_srv_ip = "%d.%d.%d.%d" % (*original_srv_ip,)
-    return original_srv_ip, original_srv_port
-
-
-def open_connection(ip, port):
-    '''Open a connection to the original destination'''
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((ip, port))
-    sock.setblocking(False)
-    return sock
-
-
-def create_marker_id():
-    marker = os.urandom(MARKER_LEN)
-    return marker
-
-
-def accept(sock, pre_mirror=False):
-    '''Accept incoming connection and pair it with one to original dest'''
-    conn, addr = sock.accept()  # Should be ready
-    orig_ip, orig_port = original_dst(conn, pre_mirror)
-    log.info('accepted from %s:%d with original destination %s:%d' %
-             (*addr, orig_ip, orig_port))
-    conn.setblocking(False)
-    if pre_mirror:
-        other_conn = open_connection(*MIRROR_IP)
-        marker = create_marker_id()
-        other_conn.send(marker)
-    else:
-        # receive the marker first
-        if LINK_STREAMS:
-            r, _, _ = select.select([conn], [], [], 5)
-            if r:
-                marker = conn.recv(MARKER_LEN)
-            else:
-                log.error("Mirrored stream not received")
-                return None
-        else:
-            marker = create_marker_id()
-        if TEST_SERVICE:  # for testing. can be removed
-            other_conn = open_connection(*TEST_SERVICE)
-        else:  # TODO untested
-            orig_dest = streams[marker][True].orig_dest
-            other_conn = open_connection(orig_dest)
-    log.debug('created stream pair [%x]: %s, %s' %
-              (int.from_bytes(marker, "little"), conn, other_conn))
-    Stream(conn, other_conn, marker, (orig_ip, orig_port), pre_mirror)
-
-
 def do_tls_handshake(s):
     while True:
         try:
@@ -380,12 +293,91 @@ def do_tls_handshake(s):
                 raise
 
 
-def start_data_forwarding(sock, pre_mirror=False):
+def original_dst(conn):
+    '''Find original destination of an incoming connection'''
+    original_dst = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+    original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
+                                                       original_dst)
+    original_srv_ip = "%d.%d.%d.%d" % (*original_srv_ip,)
+    return original_srv_ip, original_srv_port
+
+
+def open_connection(ip, port, netns_name=None):
+    '''Open a connection to the original destination'''
+    if netns_name:
+        sock = netns.socket(
+            netns.get_ns_path(nsname=netns_name),
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((ip, port))
+    sock.setblocking(False)
+    return sock
+
+
+def accept(sock):
+    '''Accept incoming connection (S1) and create the other sockets'''
+    S1, addr = sock.accept()  # Should be ready
+    orig_ip, orig_port = original_dst(S1)
+    if TEST_SERVICE:
+        orig_ip, orig_port = TEST_SERVICE
+    log.info('accepted from %s:%d with original destination %s:%d' %
+             (*addr, orig_ip, orig_port))
+    S1.setblocking(False)
+
+    # TODO find temp ports
+    t1 = ThreadWithReturnValue(
+        target=accept_connection,
+        args=(SUBNET + '.1', LISTEN_PORT+1, NETNS),
+        daemon=True,
+    )
+    t1.start()
+
+    t2 = ThreadWithReturnValue(
+        target=accept_connection,
+        args=(SUBNET + '.254', LISTEN_PORT+1),
+        daemon=True,
+    )
+    t2.start()
+
     while True:
-        accept(sock, pre_mirror)
+        try:
+            S2 = open_connection(SUBNET + '.1', LISTEN_PORT+1)
+            break
+        except ConnectionRefusedError:
+            time.sleep(.05)
+    while True:
+        try:
+            S4 = open_connection(SUBNET + '.254', LISTEN_PORT+1, NETNS)
+            break
+        except ConnectionRefusedError:
+            time.sleep(.05)
+    S3 = t1.join()
+    S5 = t2.join()
+
+    log.info("Connecting to %s:%d..." % (orig_ip, orig_port))
+    try:
+        S6 = open_connection(orig_ip, orig_port)
+    except Exception:
+        log.exception("Exception while connection to original destination:")
+        for s in [S1, S2, S3, S4, S5]:
+            s.close()
+        return None
+
+    return Forwarder([S1, S2, S3, S4, S5, S6])
 
 
-def create_main_socket(ip, port, netns_name=None):
+def start_data_forwarding(sock):
+    while True:
+        log.debug("waiting")
+        f = accept(sock)
+        if f:
+            f.start()
+
+
+def accept_connection(ip, port, netns_name=None):
     if netns_name:
         sock = netns.socket(
             netns.get_ns_path(nsname=netns_name),
@@ -395,10 +387,13 @@ def create_main_socket(ip, port, netns_name=None):
     else:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    log.info('Start listening for incoming connections on port %d...' % port)
+    log.info('Start listening for incoming connections on %s:%d...' % (ip,
+                                                                       port))
     sock.bind((ip, port))
-    sock.listen(128)
-    return sock
+    sock.listen(2)
+    conn, addr = sock.accept()
+    log.debug("Accepted from %s:%d" % (*addr,))
+    return conn
 
 
 def run_steps(steps, ignore_errors=False):
@@ -431,6 +426,8 @@ setup_ns = [
     'ip netns exec %(netns)s ip addr add %(subnet)s.1/23 dev %(devname)s-a',
     'ip link set %(devname)s up',
     'ip addr add %(subnet)s.254/24 dev %(devname)s',
+    'ip netns exec %(netns)s ip route add default via '
+    '%(subnet)s.254 dev %(devname)s-a'
 ]
 
 
@@ -441,28 +438,18 @@ teardown_ns = [
 
 
 def main():
-    port = LISTEN_PORT
-    main_sock = create_main_socket('0.0.0.0', port)
-    mirror_sock = create_main_socket('0.0.0.0', port+1)
+    lport = args.LPORT
+    lhost = args.LHOST
     run_steps(setup_ns)
-    ns_sock = create_main_socket('0.0.0.0', port+1, netns_name=NETNS)
-
-    threading.Thread(
-        target=start_data_forwarding,
-        args=(main_sock, True),
-        daemon=True
-    ).start()
-
-    t = threading.Thread(
-        target=start_data_forwarding,
-        args=(mirror_sock,),
-        daemon=True
-    )
-    t.start()
+    main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    log.info('Start listening for incoming connections on %s:%d...' %
+             (lhost, lport))
+    main_sock.bind((lhost, lport))
+    main_sock.listen(128)
 
     try:
-        t.join()
+        start_data_forwarding(main_sock)
     except KeyboardInterrupt:
         print('\r', end='')  # prevent '^C' on console
-        log.info('Caught Ctrl-C, killing threads...')
-        #  https://stackoverflow.com/questions/10090236/how-to-stop-a-python-socket-accept-call
+        log.info('Caught Ctrl-C, exiting...')
