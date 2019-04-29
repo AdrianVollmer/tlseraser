@@ -45,7 +45,7 @@ MARKER_LEN = 8
 LISTEN_PORT = args.LPORT
 MIRROR_IP = [args.M_LHOST, args.M_LPORT]
 if args.TESTING:
-    TEST_SERVICE = ['ptav.sy.gs', 443]
+    TEST_SERVICE = ('ptav.sy.gs', 443)
 else:
     TEST_SERVICE = None
 
@@ -78,11 +78,22 @@ class ThreadWithReturnValue(threading.Thread):
 
 
 class Forwarder(threading.Thread):
-    def __init__(self, sockets):
+    def __init__(self, sockets, orig_dest):
         super(Forwarder, self).__init__()
-        self.sockets = sockets
         self.id = "%08x" % random.randint(0, 2**32)
         self.active = True
+        self.sockets = sockets
+        log.info("Connecting to %s:%d..." % orig_dest)
+        try:
+            S6 = open_connection(*orig_dest)
+            self.sockets.append(S6)
+        except Exception:
+            log.exception("Exception while connection to original destination")
+            for s in self.sockets:
+                s.close()
+            self.active = False
+            #  return None
+
         self.init_sockets()
         self.key_cert = None
 
@@ -114,7 +125,7 @@ class Forwarder(threading.Thread):
         log.debug("[%s] Start loop" % self.id)
         while self.active:
             #  try:
-            if WAIT_FOR_HANDSHAKE and not self.pre_mirror:
+            if WAIT_FOR_HANDSHAKE:
                 time.sleep(.1)
             else:
                 self.forward_data()
@@ -320,11 +331,11 @@ def open_connection(ip, port, netns_name=None):
 def accept(sock):
     '''Accept incoming connection (S1) and create the other sockets'''
     S1, addr = sock.accept()  # Should be ready
-    orig_ip, orig_port = original_dst(S1)
+    orig_dest = original_dst(S1)
     if TEST_SERVICE:
-        orig_ip, orig_port = TEST_SERVICE
+        orig_dest = TEST_SERVICE
     log.info('accepted from %s:%d with original destination %s:%d' %
-             (*addr, orig_ip, orig_port))
+             (*addr, *orig_dest))
     S1.setblocking(False)
 
     # TODO find temp ports
@@ -357,21 +368,12 @@ def accept(sock):
     S3 = t1.join()
     S5 = t2.join()
 
-    log.info("Connecting to %s:%d..." % (orig_ip, orig_port))
-    try:
-        S6 = open_connection(orig_ip, orig_port)
-    except Exception:
-        log.exception("Exception while connection to original destination:")
-        for s in [S1, S2, S3, S4, S5]:
-            s.close()
-        return None
-
-    return Forwarder([S1, S2, S3, S4, S5, S6])
+    return Forwarder([S1, S2, S3, S4, S5], orig_dest)
 
 
 def start_data_forwarding(sock):
     while True:
-        log.debug("waiting")
+        log.debug("Waiting for connection")
         f = accept(sock)
         if f:
             f.start()
