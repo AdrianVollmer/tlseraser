@@ -20,7 +20,6 @@ with tcpdump.
 #                          S3  S4
 #
 # Terminate TLS at S1, re-establish it at S6
-# S1: main_sock, S3: ns_sock, S5: mirror_sock
 
 from tlseraser.args import args
 import os
@@ -39,7 +38,7 @@ log = logging.getLogger(__name__)
 
 SO_ORIGINAL_DST = 80
 
-ERASE_TLS = True  # streams must be linked for this to work
+ERASE_TLS = True
 LISTEN_PORT = args.LPORT
 if args.TESTING:
     TEST_SERVICE = ('ptav.sy.gs', 443)
@@ -85,11 +84,11 @@ class Forwarder(threading.Thread):
             S6 = open_connection(*orig_dest)
             self.sockets.append(S6)
         except Exception:
-            log.exception("Exception while connection to original destination")
+            log.exception("[%s] Exception while connecting to original "
+                          "destination", self.id)
             for s in self.sockets:
                 s.close()
             self.active = False
-            #  return None
 
         self.init_sockets()
         self.key_cert = None
@@ -165,20 +164,15 @@ class Forwarder(threading.Thread):
                 return
             else:
                 data = conn.recv(1024)
-        except ConnectionResetError:
-            log.debug("Connection reset: %s" % conn)
-            self.disconnect()
+        except (ConnectionResetError, OSError):
+            log.debug("[%s] Connection reset: %s" % (self.id, conn))
+            self.disconnect(conn)
             return
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
-            return
+            return False
         except ssl.SSLError:
-            log.exception("Exception while reading")
-            #  self.disconnect()
-            return
-        except OSError:
-            log.info('[%s] Connection reset by peer' % self.id)
-            self.disconnect()
+            log.exception("[%s] Exception while reading" % self.id)
             return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
@@ -203,7 +197,7 @@ class Forwarder(threading.Thread):
                 # re-add socket to write_socks though to re-try the write
                 self.write_socks.append(conn)
             except OSError:
-                log.exception("Exception while writing")
+                log.exception("[%s] Exception while writing" % self.id)
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
@@ -218,13 +212,13 @@ class Forwarder(threading.Thread):
                                             b"\x03\x03",
                                             b"\x02\x00"]
                     )
-        except ValueError as e:
-            log.error(e)
+        except ValueError:
+            log.exception("[%s] Exception while looking for client hello" %
+                          self.id)
 
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
-        log.debug("Wrapping connection in TLS")
-        log.debug("Perform TLS handshakes")
+        log.debug("[%s] Wrapping connection in TLS" % self.id)
         self.sockets[0] = self.tlsify_server(self.sockets[0])
         self.sockets[5] = self.tlsify_client(self.sockets[5])
         do_tls_handshake(self.sockets[0])
@@ -249,19 +243,20 @@ class Forwarder(threading.Thread):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        log.debug("Retrieve original certificate and clone it")
+        log.debug("[%s] Retrieve original certificate and clone it" %
+                  self.id)
         srv = self.sockets[5]
         peer = "%s:%d" % (srv.getpeername())
         if CA_key:
-            log.error("CA not yet implemented")
-            #  cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
+            #  log.error("[%s] CA not yet implemented" % self.id)
+            cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
         else:
             cmd = [os.path.join(sys.path[0], "clone-cert.sh"), peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
-            log.error("%s - %s" % (str(e), e.stdout.decode()))
+            log.error("[%s] %s - %s" % (self.id, str(e), e.stdout.decode()))
             return None
         return fake_cert.split(b'\n')[:2]
 
