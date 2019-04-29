@@ -40,24 +40,22 @@ log = logging.getLogger(__name__)
 SO_ORIGINAL_DST = 80
 
 ERASE_TLS = True  # streams must be linked for this to work
-LINK_STREAMS = True  # 'False' untested - TODO
-MARKER_LEN = 8
 LISTEN_PORT = args.LPORT
-MIRROR_IP = [args.M_LHOST, args.M_LPORT]
 if args.TESTING:
     TEST_SERVICE = ('ptav.sy.gs', 443)
 else:
     TEST_SERVICE = None
 
-#  inport=$1
-#  outport=$inport
-SUBNET = '192.168.253'
+SUBNET = args.MIRROR_SUBNET
 DEVNAME = 'noTLS'
 NETNS = 'mirror'
 
 # If one end is performing the TLS handshake, we need to pause the data
 # forwarding or the sockets will get mixed up
 WAIT_FOR_HANDSHAKE = False
+
+open_ports = {}
+port_id = 0  # counter for referring to open ports between threads
 
 
 class ThreadWithReturnValue(threading.Thread):
@@ -69,8 +67,7 @@ class ThreadWithReturnValue(threading.Thread):
 
     def run(self):
         if self._target is not None:
-            self._return = self._target(*self._args,
-                                        **self._kwargs)
+            self._return = self._target(*self._args, **self._kwargs)
 
     def join(self, *args):
         threading.Thread.join(self, *args)
@@ -330,44 +327,46 @@ def open_connection(ip, port, netns_name=None):
 
 def accept(sock):
     '''Accept incoming connection (S1) and create the other sockets'''
+    global port_id
     S1, addr = sock.accept()  # Should be ready
     orig_dest = original_dst(S1)
     if TEST_SERVICE:
         orig_dest = TEST_SERVICE
-    log.info('accepted from %s:%d with original destination %s:%d' %
+    log.info('Accepted from %s:%d with original destination %s:%d' %
              (*addr, *orig_dest))
     S1.setblocking(False)
 
-    # TODO find temp ports
     t1 = ThreadWithReturnValue(
         target=accept_connection,
-        args=(SUBNET + '.1', LISTEN_PORT+1, NETNS),
+        args=(port_id, SUBNET + '.1', 0, NETNS),
         daemon=True,
     )
+    port_id += 1
     t1.start()
 
     t2 = ThreadWithReturnValue(
         target=accept_connection,
-        args=(SUBNET + '.254', LISTEN_PORT+1),
+        args=(port_id, SUBNET + '.254', 0, None),
         daemon=True,
     )
+    port_id += 1
     t2.start()
 
     while True:
         try:
-            S2 = open_connection(SUBNET + '.1', LISTEN_PORT+1)
+            S2 = open_connection(*(open_ports[port_id-2]))
             break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, KeyError):
             time.sleep(.05)
     while True:
         try:
-            S4 = open_connection(SUBNET + '.254', LISTEN_PORT+1, NETNS)
+            S4 = open_connection(*(open_ports[port_id-1]), NETNS)
             break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, KeyError):
             time.sleep(.05)
+
     S3 = t1.join()
     S5 = t2.join()
-
     return Forwarder([S1, S2, S3, S4, S5], orig_dest)
 
 
@@ -379,7 +378,7 @@ def start_data_forwarding(sock):
             f.start()
 
 
-def accept_connection(ip, port, netns_name=None):
+def accept_connection(port_id, ip, port=0, netns_name=None):
     if netns_name:
         sock = netns.socket(
             netns.get_ns_path(nsname=netns_name),
@@ -389,9 +388,11 @@ def accept_connection(ip, port, netns_name=None):
     else:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    log.info('Start listening for incoming connections on %s:%d...' % (ip,
-                                                                       port))
     sock.bind((ip, port))
+    log.info('Start listening for incoming connections on %s:%d...' %
+             sock.getsockname())
+    global open_ports
+    open_ports[port_id] = sock.getsockname()
     sock.listen(2)
     conn, addr = sock.accept()
     log.debug("Accepted from %s:%d" % (*addr,))

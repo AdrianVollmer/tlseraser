@@ -27,12 +27,11 @@ parser.add_argument(
 
 parser.add_argument(
     '-m',
-    '--mirror',
-    default="192.168.253.1:1235",
-    dest="MIRROR",
+    '--mirror-subnet',
+    default="192.168.253",
+    dest="MIRROR_SUBNET",
     type=str,
-    help="the IP address and the IP address of the pcap mirror "
-         "(default: 192.168.253.1:1235)"
+    help="the IP subnet of the pcap mirror (default: %(default)s)"
 )
 
 parser.add_argument(
@@ -45,10 +44,3 @@ parser.add_argument(
 
 
 args = parser.parse_args()
-
-try:
-    args.M_LHOST, args.M_LPORT = args.MIRROR.split(":")
-    args.M_LPORT = int(args.M_LPORT)
-except Exception:
-    log.critical("Argument 'mirror' must be of the form <IP>:<PORT>")
-    exit(1)
