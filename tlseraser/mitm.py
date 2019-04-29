@@ -9,7 +9,21 @@ with tcpdump.
 
 TODO:
     - idea: instead of using markers, link streams by blocking new connections
+
 """
+
+#                 S1  S2            S5  S6
+#  source ---->----o  o              o  o---->---- original destination
+#                      \            /
+#                       \          /                        namespace 1
+#  ====================================================================
+#                         \      /                          namespace 2
+#                          \    /
+#                           o  o
+#                          S3  S4
+#
+# Terminate TLS at S1, re-establish it at S6
+# S1: main_sock, S3: ns_sock, S5: mirror_sock
 
 from tlseraser.args import args
 import os
@@ -19,6 +33,7 @@ import select
 import struct
 import ssl
 import subprocess
+import netns
 import threading
 import time
 import logging
@@ -35,6 +50,12 @@ if args.TESTING:
     TEST_SERVICE = ['ptav.sy.gs', 443]
 else:
     TEST_SERVICE = None
+
+#  inport=$1
+#  outport=$inport
+SUBNET = '192.168.253'
+DEVNAME = 'noTLS'
+NETNS = 'mirror'
 
 # If one end is performing the TLS handshake, we need to pause the data
 # forwarding or the sockets will get mixed up
@@ -193,14 +214,14 @@ class Stream(threading.Thread):
         peer = self.peer_of(conn)
         self.buffers[peer] = self.buffers[peer][c:]
 
-    def get_paired_connection(self):
-        '''Return the paired connection that shares the same marker'''
+    def get_paired_stream(self):
+        '''Return the paired stream that shares the same marker'''
         if not LINK_STREAMS:
             log.error("Connections are not linked, use LINK_STREAMS=True")
             return None
         other_conn = not self.pre_mirror
         if other_conn not in streams[self.marker]:
-            log.warning("[%s] Paired connection not ready" %
+            log.warning("[%s] Paired stream not ready" %
                         self.marker_str)
             while other_conn not in streams[self.marker]:
                 time.sleep(.1)
@@ -225,7 +246,7 @@ class Stream(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("Wrapping connection in TLS")
-        peer = self.get_paired_connection()
+        peer = self.get_paired_stream()
         if peer:
             peer.client_sock = peer.tlsify_client(peer.client_sock)
             self.server_sock = self.tlsify_server(self.server_sock)
@@ -254,7 +275,7 @@ class Stream(threading.Thread):
 
         It will be self-signed unless the private key of a CA is given'''
         log.debug("Retrieve original certificate and clone it")
-        srv = self.get_paired_connection()
+        srv = self.get_paired_stream()
         peer = "%s:%d" % (srv.client_sock.getpeername())
         if CA_key:
             log.error("CA not yet implemented")
@@ -272,7 +293,7 @@ class Stream(threading.Thread):
     def get_cached_cert(self):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
-        srv = self.get_paired_connection()
+        srv = self.get_paired_stream()
         peer = "%s:%d" % (srv.client_sock.getpeername())
         cert_filename = os.path.join('/tmp/', '%s_0' % peer)
         key_filename = cert_filename + '.key'
@@ -331,8 +352,8 @@ def accept(sock, pre_mirror=False):
             if r:
                 marker = conn.recv(MARKER_LEN)
             else:
-                log.error("Mirrored connection not received")
-                return None, None, None
+                log.error("Mirrored stream not received")
+                return None
         else:
             marker = create_marker_id()
         if TEST_SERVICE:  # for testing. can be removed
@@ -340,7 +361,7 @@ def accept(sock, pre_mirror=False):
         else:  # TODO untested
             orig_dest = streams[marker][True].orig_dest
             other_conn = open_connection(orig_dest)
-    log.debug('created connection pair [%x]: %s, %s' %
+    log.debug('created stream pair [%x]: %s, %s' %
               (int.from_bytes(marker, "little"), conn, other_conn))
     Stream(conn, other_conn, marker, (orig_ip, orig_port), pre_mirror)
 
@@ -364,19 +385,67 @@ def start_data_forwarding(sock, pre_mirror=False):
         accept(sock, pre_mirror)
 
 
-def create_main_socket(ip, port):
-    main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def create_main_socket(ip, port, netns_name=None):
+    if netns_name:
+        sock = netns.socket(
+            netns.get_ns_path(nsname=netns_name),
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     log.info('Start listening for incoming connections on port %d...' % port)
-    main_sock.bind((ip, port))
-    main_sock.listen(128)
-    return main_sock
+    sock.bind((ip, port))
+    sock.listen(128)
+    return sock
+
+
+def run_steps(steps, ignore_errors=False):
+    parameters = {
+        "netns": NETNS,
+        "devname": DEVNAME,
+        "subnet": SUBNET,
+    }
+    for step in steps:
+        try:
+            subprocess.check_output((step % parameters).split(),
+                                    stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            if ignore_errors:
+                pass
+            else:
+                print(e.output.decode())
+                raise
+
+
+setup_ns = [
+    # create a test network namespace:
+    'ip netns add %(netns)s',
+    # create a pair of virtual network interfaces ($devname-a and $devname):
+    'ip link add %(devname)s-a type veth peer name %(devname)s',
+    # change the active namespace of the $devname-a interface:
+    'ip link set %(devname)s-a netns %(netns)s',
+    # configure the IP addresses of the virtual interfaces:
+    'ip netns exec %(netns)s ip link set %(devname)s-a up',
+    'ip netns exec %(netns)s ip addr add %(subnet)s.1/23 dev %(devname)s-a',
+    'ip link set %(devname)s up',
+    'ip addr add %(subnet)s.254/24 dev %(devname)s',
+]
+
+
+teardown_ns = [
+    'ip link del %(devname)s',
+    'ip netns del %(netns)s',
+]
 
 
 def main():
     port = LISTEN_PORT
     main_sock = create_main_socket('0.0.0.0', port)
     mirror_sock = create_main_socket('0.0.0.0', port+1)
+    run_steps(setup_ns)
+    ns_sock = create_main_socket('0.0.0.0', port+1, netns_name=NETNS)
 
     threading.Thread(
         target=start_data_forwarding,
@@ -384,15 +453,16 @@ def main():
         daemon=True
     ).start()
 
-    threading.Thread(
+    t = threading.Thread(
         target=start_data_forwarding,
         args=(mirror_sock,),
         daemon=True
-    ).start()
+    )
+    t.start()
 
     try:
-        subprocess.run([os.path.join(sys.path[0], 'pcap-mirror.sh'),
-                        '%d' % (port+1)])
+        t.join()
     except KeyboardInterrupt:
         print('\r', end='')  # prevent '^C' on console
-        log.info('Caught Ctrl-C, exiting')
+        log.info('Caught Ctrl-C, killing threads...')
+        #  https://stackoverflow.com/questions/10090236/how-to-stop-a-python-socket-accept-call

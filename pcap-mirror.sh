@@ -3,7 +3,6 @@
 # network interface where we can see the clear text traffic
 # https://askubuntu.com/questions/11709/how-can-i-capture-network-traffic-of-a-single-process
 
-set -e
 set -u
 
 if [ "$(id -u)" != "0" ]; then
@@ -18,10 +17,12 @@ subnet=192.168.253
 devname=noTLS
 
 function finish {
-    # ip link del $devname-a
-    ip netns del $netns
+    ip netns del $netns 2> /dev/null
 }
-trap finish EXIT
+trap finish EXIT SIGINT SIGTERM SIGUSR1
+
+# delete network namespace if it still exists:
+if [[ `ip netns show` =~ $netns ]] ; then ip netns del $netns 2> /dev/null ; fi
 
 # create a test network namespace:
 ip netns add $netns
