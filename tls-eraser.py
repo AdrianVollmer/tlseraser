@@ -21,10 +21,13 @@
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 from tlseraser.mitm import main, run_steps, teardown_ns
+from tlseraser.args import args
 
 import atexit
 import logging
-logging.basicConfig(level=logging.DEBUG)
+
+level = logging.getLevelName(args.LOG_LEVEL)
+logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
 
 atexit.register(run_steps, teardown_ns, True)

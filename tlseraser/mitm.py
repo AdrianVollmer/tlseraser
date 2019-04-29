@@ -129,14 +129,15 @@ class Forwarder(threading.Thread):
             self.sockets[5]: self.sockets[4],
         }
         self.read_socks = self.sockets
+        self.signal_pipe = os.pipe()
+        self.read_socks.append(self.signal_pipe[0])
         self.write_socks = []
 
     def disconnect(self, conn):
         '''Disconnect a socket and its peer'''
         self.active = False
-        self.peer[conn].close()
-        self.read_socks.remove(conn)
-        self.read_socks.remove(self.peer[conn])
+        # sending something to signal pipe so select call returns
+        os.write(self.signal_pipe[1], b'_')
 
     def run(self):
         '''The main loop'''
@@ -172,7 +173,10 @@ class Forwarder(threading.Thread):
             self.write_to_sock(conn)
         self.write_socks = []
         for conn in r:
-            self.read_from_sock(conn)
+            if r == self.signal_pipe[0]:
+                os.read(r, 1)
+            else:
+                self.read_from_sock(conn)
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
@@ -181,9 +185,11 @@ class Forwarder(threading.Thread):
         try:
             if self.should_starttls(conn):
                 WAIT_FOR_HANDSHAKE = True
-                self.starttls()
-                WAIT_FOR_HANDSHAKE = False
-                return
+                try:
+                    self.starttls()
+                finally:
+                    WAIT_FOR_HANDSHAKE = False
+                    return False
             else:
                 data = conn.recv(1024)
         except ssl.SSLWantReadError:
@@ -191,6 +197,7 @@ class Forwarder(threading.Thread):
             return False
         except ssl.SSLError:
             log.exception("[%s] Exception while reading" % self.id)
+            self.disconnect(conn)
             return False
         except (ConnectionResetError, OSError):
             log.debug("[%s] Connection reset: %s" % (self.id, conn))
@@ -203,6 +210,7 @@ class Forwarder(threading.Thread):
         else:
             log.info("[%s] Connection closed" % self.id)
             self.disconnect(conn)
+        return True
 
     def write_to_sock(self, conn):
         '''Write data from a buffer to a socket'''
@@ -243,8 +251,8 @@ class Forwarder(threading.Thread):
         log.debug("[%s] Wrapping connection in TLS" % self.id)
         self.sockets[0] = self.tlsify_server(self.sockets[0])
         self.sockets[5] = self.tlsify_client(self.sockets[5])
-        do_tls_handshake(self.sockets[0])
-        do_tls_handshake(self.sockets[5])
+        self.do_tls_handshake(self.sockets[0])
+        self.do_tls_handshake(self.sockets[5])
         self.init_sockets()
 
     def tlsify_server(self, conn):
@@ -303,19 +311,21 @@ class Forwarder(threading.Thread):
             do_handshake_on_connect=False,
         )
 
-
-def do_tls_handshake(s):
-    while True:
-        try:
-            s.do_handshake()
-            break
-        except ssl.SSLError as err:
-            if err.args[0] == ssl.SSL_ERROR_WANT_READ:
-                select.select([s], [], [])
-            elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
-                select.select([], [s], [])
-            else:
-                raise
+    def do_tls_handshake(self, s):
+        while True:
+            try:
+                s.do_handshake()
+                break
+            except ssl.SSLError as err:
+                if err.args[0] == ssl.SSL_ERROR_WANT_READ:
+                    select.select([s], [], [])
+                elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
+                    select.select([], [s], [])
+                elif err.reason == "TLSV1_ALERT_UNKNOWN_CA":
+                    log.error("[%s] Client does not trust our cert" %
+                              self.id)
+                else:
+                    raise
 
 
 def original_dst(conn):

@@ -24,6 +24,8 @@ import argparse
 import logging
 log = logging.getLogger(__name__)
 
+_LOG_LEVEL_STRINGS = ['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG']
+
 parser = argparse.ArgumentParser(
     description="Terminate TLS encrpytion and mirror the clear text traffic "
                 "on another device"
@@ -64,5 +66,13 @@ parser.add_argument(
     help='for testing purposes only',
 )
 
+parser.add_argument(
+    '--log-level',
+    dest="LOG_LEVEL",
+    default='INFO',
+    type=str,
+    choices=_LOG_LEVEL_STRINGS,
+    help='the logging level (default: %(default)s)',
+)
 
 args = parser.parse_args()
