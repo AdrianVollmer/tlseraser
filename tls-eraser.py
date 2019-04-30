@@ -20,17 +20,14 @@
 #  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from tlseraser.mitm import main, run_steps, teardown_ns
+from tlseraser.mitm import TLSEraser
 from tlseraser.args import args
 
-import atexit
 import logging
 
 level = logging.getLevelName(args.LOG_LEVEL)
 logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
 
-atexit.register(run_steps, teardown_ns, True)
-
 if __name__ == "__main__":
-    main()
+    TLSEraser(args.LPORT, args.LHOST, target=args.TARGET).run()

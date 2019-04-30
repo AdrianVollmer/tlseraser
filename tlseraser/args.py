@@ -59,11 +59,14 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    '--testing',
-    dest="TESTING",
-    default=False,
-    action='store_true',
-    help='for testing purposes only',
+    '-t',
+    '--target',
+    dest="TARGET",
+    default=None,
+    type=str,
+    help='the target service as <HOST>:<IP>; if none is given '
+    '(the default), the original destination of NATed TCP packets is '
+    'determined via SO_ORIGINAL_DST',
 )
 
 parser.add_argument(

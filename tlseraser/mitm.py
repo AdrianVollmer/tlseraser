@@ -43,7 +43,6 @@ with tcpdump.
 #
 # Terminate TLS at S1, re-establish it at S6
 
-from tlseraser.args import args
 import os
 import sys
 import socket
@@ -58,25 +57,10 @@ import time
 import logging
 log = logging.getLogger(__name__)
 
-SO_ORIGINAL_DST = 80
+_SO_ORIGINAL_DST = 80
 
-ERASE_TLS = True
-LISTEN_PORT = args.LPORT
-if args.TESTING:
-    TEST_SERVICE = ('ptav.sy.gs', 443)
-else:
-    TEST_SERVICE = None
-
-SUBNET = args.MIRROR_SUBNET
-DEVNAME = 'noTLS'
-NETNS = 'mirror'
-
-# If one end is performing the TLS handshake, we need to pause the data
-# forwarding or the sockets will get mixed up
-WAIT_FOR_HANDSHAKE = False
-
-open_ports = {}
-port_id = 0  # counter for referring to open ports between threads
+_open_ports = {}
+_port_id = 0  # counter for referring to open ports between threads
 
 
 class ThreadWithReturnValue(threading.Thread):
@@ -96,14 +80,15 @@ class ThreadWithReturnValue(threading.Thread):
 
 
 class Forwarder(threading.Thread):
-    def __init__(self, sockets, orig_dest):
+    def __init__(self, sockets, orig_dest, erase_tls=True):
         super(Forwarder, self).__init__()
         self.id = "%08x" % random.randint(0, 2**32)
+        self.erase_tls = erase_tls
         self.active = True
         self.sockets = sockets
         log.info("Connecting to %s:%d..." % orig_dest)
         try:
-            S6 = open_connection(*orig_dest)
+            S6 = _open_connection(*orig_dest)
             self.sockets.append(S6)
         except Exception:
             log.exception("[%s] Exception while connecting to original "
@@ -133,7 +118,7 @@ class Forwarder(threading.Thread):
         self.read_socks.append(self.signal_pipe[0])
         self.write_socks = []
 
-    def disconnect(self, conn):
+    def disconnect(self):
         '''Disconnect a socket and its peer'''
         self.active = False
         # sending something to signal pipe so select call returns
@@ -144,10 +129,7 @@ class Forwarder(threading.Thread):
         log.debug("[%s] Start loop" % self.id)
         while self.active:
             #  try:
-            if WAIT_FOR_HANDSHAKE:
-                time.sleep(.1)
-            else:
-                self.forward_data()
+            self.forward_data()
             #  except (ssl.SSLError, ssl.SSLEOFError) as e:
             #      log.error("SSLError: %s" % str(e))
             #  except (ConnectionResetError) as e:
@@ -159,7 +141,7 @@ class Forwarder(threading.Thread):
 
     def should_starttls(self, conn):
         '''Check if we want and can wrap the sockets in TLS now'''
-        return (ERASE_TLS
+        return (self.erase_tls
                 and conn == self.sockets[0]
                 and not isinstance(conn, ssl.SSLSocket)
                 and self.got_client_hello(conn)
@@ -169,26 +151,23 @@ class Forwarder(threading.Thread):
         '''Move data from one socket to the other'''
         #  log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
-        for conn in w:
-            self.write_to_sock(conn)
         self.write_socks = []
-        for conn in r:
-            if r == self.signal_pipe[0]:
+        for s in w:
+            self.write_to_sock(s)
+        for s in r:
+            if s == self.signal_pipe[0]:
                 os.read(r, 1)
             else:
-                self.read_from_sock(conn)
+                self.read_from_sock(s)
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
         #  log.debug("reading")
-        global WAIT_FOR_HANDSHAKE
         try:
             if self.should_starttls(conn):
-                WAIT_FOR_HANDSHAKE = True
                 try:
                     self.starttls()
                 finally:
-                    WAIT_FOR_HANDSHAKE = False
                     return False
             else:
                 data = conn.recv(1024)
@@ -197,11 +176,11 @@ class Forwarder(threading.Thread):
             return False
         except ssl.SSLError:
             log.exception("[%s] Exception while reading" % self.id)
-            self.disconnect(conn)
+            self.disconnect()
             return False
         except (ConnectionResetError, OSError):
             log.debug("[%s] Connection reset: %s" % (self.id, conn))
-            self.disconnect(conn)
+            self.disconnect()
             return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
@@ -209,7 +188,7 @@ class Forwarder(threading.Thread):
             self.write_socks.append(self.peer[conn])
         else:
             log.info("[%s] Connection closed" % self.id)
-            self.disconnect(conn)
+            self.disconnect()
         return True
 
     def write_to_sock(self, conn):
@@ -328,109 +307,11 @@ class Forwarder(threading.Thread):
                     raise
 
 
-def original_dst(conn):
-    '''Find original destination of an incoming connection'''
-    original_dst = conn.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
-    original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
-                                                       original_dst)
-    original_srv_ip = "%d.%d.%d.%d" % (*original_srv_ip,)
-    return original_srv_ip, original_srv_port
-
-
-def open_connection(ip, port, netns_name=None):
-    '''Open a connection to the original destination'''
-    if netns_name:
-        sock = netns.socket(
-            netns.get_ns_path(nsname=netns_name),
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((ip, port))
-    sock.setblocking(False)
-    return sock
-
-
-def accept(sock):
-    '''Accept incoming connection (S1) and create the other sockets'''
-    global port_id
-    S1, addr = sock.accept()  # Should be ready
-    orig_dest = original_dst(S1)
-    if TEST_SERVICE:
-        orig_dest = TEST_SERVICE
-    log.info('Accepted from %s:%d with original destination %s:%d' %
-             (*addr, *orig_dest))
-    S1.setblocking(False)
-
-    t1 = ThreadWithReturnValue(
-        target=accept_connection,
-        args=(port_id, SUBNET + '.1', 0, NETNS),
-        daemon=True,
-    )
-    port_id += 1
-    t1.start()
-
-    t2 = ThreadWithReturnValue(
-        target=accept_connection,
-        args=(port_id, SUBNET + '.254', 0, None),
-        daemon=True,
-    )
-    port_id += 1
-    t2.start()
-
-    while True:
-        try:
-            S2 = open_connection(*(open_ports[port_id-2]))
-            break
-        except (ConnectionRefusedError, KeyError):
-            time.sleep(.05)
-    while True:
-        try:
-            S4 = open_connection(*(open_ports[port_id-1]), NETNS)
-            break
-        except (ConnectionRefusedError, KeyError):
-            time.sleep(.05)
-
-    S3 = t1.join()
-    S5 = t2.join()
-    return Forwarder([S1, S2, S3, S4, S5], orig_dest)
-
-
-def start_data_forwarding(sock):
-    while True:
-        log.debug("Waiting for connection")
-        f = accept(sock)
-        if f:
-            f.start()
-
-
-def accept_connection(port_id, ip, port=0, netns_name=None):
-    if netns_name:
-        sock = netns.socket(
-            netns.get_ns_path(nsname=netns_name),
-            socket.AF_INET,
-            socket.SOCK_STREAM,
-        )
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((ip, port))
-    log.info('Start listening for incoming connections on %s:%d...' %
-             sock.getsockname())
-    global open_ports
-    open_ports[port_id] = sock.getsockname()
-    sock.listen(2)
-    conn, addr = sock.accept()
-    log.debug("Accepted from %s:%d" % (*addr,))
-    return conn
-
-
-def run_steps(steps, ignore_errors=False):
+def _run_steps(steps, netns_name, devname, subnet, ignore_errors=False):
     parameters = {
-        "netns": NETNS,
-        "devname": DEVNAME,
-        "subnet": SUBNET,
+        "netns": netns_name,
+        "devname": devname,
+        "subnet": subnet,
     }
     for step in steps:
         try:
@@ -444,7 +325,7 @@ def run_steps(steps, ignore_errors=False):
                 raise
 
 
-setup_ns = [
+_setup_ns = [
     # create a test network namespace:
     'ip netns add %(netns)s',
     # create a pair of virtual network interfaces ($devname-a and $devname):
@@ -461,25 +342,140 @@ setup_ns = [
 ]
 
 
-teardown_ns = [
+_teardown_ns = [
     'ip link del %(devname)s',
     'ip netns del %(netns)s',
 ]
 
 
-def main():
-    lport = args.LPORT
-    lhost = args.LHOST
-    run_steps(setup_ns)
-    main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    log.info('Start listening for incoming connections on %s:%d...' %
-             (lhost, lport))
-    main_sock.bind((lhost, lport))
-    main_sock.listen(128)
+def _original_dst(conn):
+    '''Find original destination of an incoming connection'''
+    original_dst = conn.getsockopt(socket.SOL_IP, _SO_ORIGINAL_DST, 16)
+    original_srv_port, original_srv_ip = struct.unpack("!2xH4s8x",
+                                                       original_dst)
+    original_srv_ip = "%d.%d.%d.%d" % (*original_srv_ip,)
+    return original_srv_ip, original_srv_port
 
-    try:
-        start_data_forwarding(main_sock)
-    except KeyboardInterrupt:
-        print('\r', end='')  # prevent '^C' on console
-        log.info('Caught Ctrl-C, exiting...')
+
+def _open_connection(ip, port, netns_name=None):
+    '''Open a connection to the original destination'''
+    if netns_name:
+        sock = netns.socket(
+            netns.get_ns_path(nsname=netns_name),
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((ip, port))
+    sock.setblocking(False)
+    return sock
+
+
+class TLSEraser(object):
+    def __init__(self,
+                 lport,
+                 lhost='0.0.0.0',
+                 netns_name="mirror",
+                 subnet="192.168.253",
+                 devname="noTLS",
+                 erase_tls=True,
+                 target=None
+                 ):
+        self.lport = lport
+        self.lhost = lhost
+        self.netns_name = netns_name
+        self.subnet = subnet
+        self.devname = devname
+        self.erase_tls = erase_tls
+        target = target.split(':')
+        self.target = (target[0], int(target[1]))
+
+    def accept(self, sock):
+        '''Accept incoming connection (S1) and create the other sockets'''
+        global _port_id, _open_ports
+        S1, addr = sock.accept()  # Should be ready
+        orig_dest = _original_dst(S1)
+        if self.target:
+            orig_dest = self.target
+        log.info('Accepted from %s:%d with original destination %s:%d' %
+                 (*addr, *orig_dest))
+        S1.setblocking(False)
+
+        t1 = ThreadWithReturnValue(
+            target=self.accept_connection,
+            args=(_port_id, self.subnet + '.1', 0, self.netns_name),
+            daemon=True,
+        )
+        _port_id += 1
+        t1.start()
+
+        t2 = ThreadWithReturnValue(
+            target=self.accept_connection,
+            args=(_port_id, self.subnet + '.254', 0, None),
+            daemon=True,
+        )
+        _port_id += 1
+        t2.start()
+
+        while True:
+            try:
+                S2 = _open_connection(*(_open_ports[_port_id-2]))
+                break
+            except (ConnectionRefusedError, KeyError):
+                time.sleep(.05)
+        while True:
+            try:
+                S4 = _open_connection(*(_open_ports[_port_id-1]),
+                                      self.netns_name)
+                break
+            except (ConnectionRefusedError, KeyError):
+                time.sleep(.05)
+
+        del _open_ports[_port_id-1]
+        del _open_ports[_port_id-2]
+        S3 = t1.join()
+        S5 = t2.join()
+        return Forwarder([S1, S2, S3, S4, S5], orig_dest, self.erase_tls)
+
+    def start_data_forwarding(self, sock):
+        while True:
+            log.debug("Waiting for connection")
+            f = self.accept(sock)
+            if f:
+                f.start()
+
+    def accept_connection(self, port_id, ip, port=0, netns_name=None):
+        if netns_name:
+            sock = netns.socket(
+                netns.get_ns_path(nsname=netns_name),
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((ip, port))
+        log.info('Start listening for incoming connections on %s:%d...' %
+                 sock.getsockname())
+        global _open_ports
+        _open_ports[port_id] = sock.getsockname()
+        sock.listen(2)
+        conn, addr = sock.accept()
+        log.debug("Accepted from %s:%d" % (*addr,))
+        return conn
+
+    def run(self):
+        try:
+            _run_steps(_setup_ns, self.netns_name, self.devname, self.subnet)
+            main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            log.info('Start listening for incoming connections on %s:%d...' %
+                     (self.lhost, self.lport))
+            main_sock.bind((self.lhost, self.lport))
+            main_sock.listen(128)
+
+            self.start_data_forwarding(main_sock)
+        finally:
+            _run_steps(_teardown_ns, self.netns_name,
+                       self.devname, self.subnet)
