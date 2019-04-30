@@ -30,4 +30,8 @@ logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    TLSEraser(args.LPORT, args.LHOST, target=args.TARGET).run()
+    try:
+        TLSEraser(args.LPORT, args.LHOST, target=args.TARGET).run()
+    except KeyboardInterrupt:
+        print('\r', end='')  # prevent '^C' on console
+        log.info('Caught Ctrl-C, exiting...')
