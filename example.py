@@ -20,7 +20,7 @@
 #  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from tlseraser.mitm import TLSEraser
+from tlseraser.tlseraser import TLSEraser
 from tlseraser.args import args
 
 import logging
@@ -29,9 +29,8 @@ level = logging.getLevelName(args.LOG_LEVEL)
 logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
 
-if __name__ == "__main__":
-    try:
-        TLSEraser(args.LPORT, args.LHOST, target=args.TARGET).run()
-    except KeyboardInterrupt:
-        print('\r', end='')  # prevent '^C' on console
-        log.info('Caught Ctrl-C, exiting...')
+try:
+    TLSEraser(args.LPORT, args.LHOST, target=args.TARGET).run()
+except KeyboardInterrupt:
+    print('\r', end='')  # prevent '^C' on console
+    log.info('Caught Ctrl-C, exiting...')

@@ -13,6 +13,12 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/AdrianVollmer/tlseraser",
     packages=setuptools.find_packages(),
+    scripts=['bin/clone-cert.sh'],
+    entry_points={
+        'console_scripts': [
+            'tlseraser = tlseraser.__main__:main',
+        ],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
