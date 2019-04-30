@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 #  Copyright (c) 2019 Adrian Vollmer
 #
 #  Permission is hereby granted, free of charge, to any person obtaining a
@@ -21,7 +22,7 @@
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 """
-This module opens the main sockets. Incoming connections are relayed to
+This module opens the main socket. Incoming connections are relayed to
 a "socket mirror" and then to their original destination, assuming they have
 been DNATed. TLS is enabled as needed.
 
@@ -30,6 +31,10 @@ reason of having an interface that the clear text is running through to use
 with tcpdump.
 
 """
+
+__version__ = '0.0.1'
+__author__ = 'Adrian Vollmer'
+
 
 #                 S1  S2            S5  S6
 #  source ---->----o  o              o  o---->---- original destination
@@ -44,7 +49,6 @@ with tcpdump.
 # Terminate TLS at S1, re-establish it at S6
 
 import os
-import sys
 import socket
 import select
 import struct
@@ -258,9 +262,9 @@ class Forwarder(threading.Thread):
         peer = "%s:%d" % (srv.getpeername())
         if CA_key:
             #  log.error("[%s] CA not yet implemented" % self.id)
-            cmd = ["./clone-cert.sh", peer, CA_key]  # TODO
+            cmd = ["clone-cert.sh", peer, CA_key]  # TODO
         else:
-            cmd = [os.path.join(sys.path[0], "clone-cert.sh"), peer]
+            cmd = ["clone-cert.sh", peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
@@ -388,8 +392,9 @@ class TLSEraser(object):
         self.subnet = subnet
         self.devname = devname
         self.erase_tls = erase_tls
-        target = target.split(':')
-        self.target = (target[0], int(target[1]))
+        if target:
+            target = target.split(':')
+            self.target = (target[0], int(target[1]))
 
     def accept(self, sock):
         '''Accept incoming connection (S1) and create the other sockets'''
@@ -398,7 +403,7 @@ class TLSEraser(object):
         orig_dest = _original_dst(S1)
         if self.target:
             orig_dest = self.target
-        log.info('Accepted from %s:%d with original destination %s:%d' %
+        log.info('Accepted from %s:%d with target %s:%d' %
                  (*addr, *orig_dest))
         S1.setblocking(False)
 

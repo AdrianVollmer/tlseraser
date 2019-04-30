@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 #  Copyright (c) 2019 Adrian Vollmer
 #
 #  Permission is hereby granted, free of charge, to any person obtaining a
@@ -20,7 +21,8 @@
 #  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-if __name__ == '__main__':
+
+def main():
     from tlseraser.tlseraser import TLSEraser
     from tlseraser.args import args
 
@@ -35,3 +37,7 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print('\r', end='')  # prevent '^C' on console
         log.info('Caught Ctrl-C, exiting...')
+
+
+if __name__ == '__main__':
+    main()
