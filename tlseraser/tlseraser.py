@@ -243,7 +243,6 @@ class Forwarder(threading.Thread):
         keyfile, certfile = self.get_cached_cert()
         if not (keyfile and certfile):
             keyfile, certfile = self.clone_cert()
-        #  certfile, keyfile = "mitm.pem mitm.key".split()
         return ssl.wrap_socket(conn,
                                server_side=True,
                                certfile=certfile,
@@ -261,8 +260,8 @@ class Forwarder(threading.Thread):
         srv = self.sockets[5]
         peer = "%s:%d" % (srv.getpeername())
         if CA_key:
-            #  log.error("[%s] CA not yet implemented" % self.id)
-            cmd = ["clone-cert.sh", peer, CA_key]  # TODO
+            log.error("[%s] CA not yet implemented" % self.id)
+            #  cmd = ["clone-cert.sh", peer, CA_key]  # TODO
         else:
             cmd = ["clone-cert.sh", peer]
         try:
