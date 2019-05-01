@@ -48,9 +48,11 @@ __author__ = 'Adrian Vollmer'
 #
 # Terminate TLS at S1, re-establish it at S6
 
+import atexit
 import os
 import socket
 import select
+import signal
 import struct
 import ssl
 import subprocess
@@ -469,23 +471,31 @@ class TLSEraser(object):
         log.debug("Accepted from %s:%d" % (*addr,))
         return conn
 
-    def run(self):
-        try:
-            try:
-                netns.get_ns_path(nsname=self.netns_name)
-                _run_steps(_teardown_ns, self.netns_name,
-                           self.devname, self.subnet, ignore_errors=True)
-            except Exception:
-                pass
-            _run_steps(_setup_ns, self.netns_name, self.devname, self.subnet)
-            main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            log.info('Start listening for incoming connections on %s:%d...' %
-                     (self.lhost, self.lport))
-            main_sock.bind((self.lhost, self.lport))
-            main_sock.listen(128)
+    def cleanup(self, exc_type=None, exc=None, traceback=None):
+        log.info("Cleaning up")
+        _run_steps(_teardown_ns, self.netns_name, self.devname, self.subnet,
+                   ignore_errors=True)
+        os._exit(0)
+        return None
 
-            self.start_data_forwarding(main_sock)
-        finally:
+    def run(self):
+        atexit.register(self.cleanup)
+        signal.signal(signal.SIGTERM, self.cleanup)
+        signal.signal(signal.SIGHUP, self.cleanup)
+
+        try:
+            # remove possibly existing namespace
+            netns.get_ns_path(nsname=self.netns_name)
             _run_steps(_teardown_ns, self.netns_name,
-                       self.devname, self.subnet)
+                       self.devname, self.subnet, ignore_errors=True)
+        except Exception:
+            pass
+        _run_steps(_setup_ns, self.netns_name, self.devname, self.subnet)
+        main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        log.info('Start listening for incoming connections on %s:%d...' %
+                 (self.lhost, self.lport))
+        main_sock.bind((self.lhost, self.lport))
+        main_sock.listen(128)
+
+        self.start_data_forwarding(main_sock)
