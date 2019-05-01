@@ -471,6 +471,12 @@ class TLSEraser(object):
 
     def run(self):
         try:
+            try:
+                netns.get_ns_path(nsname=self.netns_name)
+                _run_steps(_teardown_ns, self.netns_name,
+                           self.devname, self.subnet, ignore_errors=True)
+            except Exception:
+                pass
             _run_steps(_setup_ns, self.netns_name, self.devname, self.subnet)
             main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
