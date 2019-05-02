@@ -124,10 +124,17 @@ class Forwarder(threading.Thread):
         self.read_socks.append(self.signal_pipe[0])
         self.write_socks = []
 
-    def disconnect(self):
+    def disconnect(self, s):
         '''Disconnect a socket and its peer'''
+        self.read_socks.remove(s)
+        self.read_socks.remove(self.peer[s])
         self.active = False
-        # sending something to signal pipe so select call returns
+        # check if buffers are all empty
+        for key, val in self.buffer.items():
+            if val:
+                self.active = True
+                break
+            # sending something to signal pipe so select call returns
         os.write(self.signal_pipe[1], b'_')
 
     def run(self):
@@ -156,13 +163,13 @@ class Forwarder(threading.Thread):
     def forward_data(self):
         '''Move data from one socket to the other'''
         #  log.debug('selecting sockets...')
-        r, w, _ = select.select(self.read_socks, self.write_socks, [], 60)
+        r, w, _ = select.select(self.read_socks, self.write_socks, [], 1)
         self.write_socks = []
         for s in w:
             self.write_to_sock(s)
         for s in r:
             if s == self.signal_pipe[0]:
-                os.read(r, 1)
+                os.read(s, 1)
             else:
                 self.read_from_sock(s)
 
@@ -176,17 +183,24 @@ class Forwarder(threading.Thread):
                 finally:
                     return False
             else:
-                data = conn.recv(1024)
+                data = b''
+                while True:
+                    part = conn.recv(1024**2)
+                    data += part
+                    # this might return prematurely if less than 1024**2 bytes
+                    # arrive...
+                    if len(part) < 1024**2:
+                        break
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return False
         except ssl.SSLError:
             log.exception("[%s] Exception while reading" % self.id)
-            self.disconnect()
+            self.disconnect(conn)
             return False
         except (ConnectionResetError, OSError):
             log.debug("[%s] Connection reset: %s" % (self.id, conn))
-            self.disconnect()
+            self.disconnect(conn)
             return False
         if data:
             #  log.debug('Read %d bytes' % len(data))
@@ -194,7 +208,7 @@ class Forwarder(threading.Thread):
             self.write_socks.append(self.peer[conn])
         else:
             log.info("[%s] Connection closed" % self.id)
-            self.disconnect()
+            self.disconnect(conn)
         return True
 
     def write_to_sock(self, conn):
@@ -396,6 +410,8 @@ class TLSEraser(object):
         if target:
             target = target.split(':')
             self.target = (target[0], int(target[1]))
+        else:
+            self.target = None
 
     def accept(self, sock):
         '''Accept incoming connection (S1) and create the other sockets'''
