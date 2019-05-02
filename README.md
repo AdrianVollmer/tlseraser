@@ -106,3 +106,27 @@ Wireshark.
 
 First, create a rule with `iptables` that redirects all traffic you want to
 eavesdrop on to port 1234 on localhost. Then run `tlseraser`.
+
+### Intercepting local traffic
+
+If you want to intercept traffic originating from your own machine, it's
+best to use `iptables` owner match. Create a new group, say 'tlseraser, with
+`addgroup tlseraser` and add your user to that group: `adduser <username> tlseraser`.
+Next, create an `iptables` rules such as this:
+
+```
+iptables -t nat -A OUTPUT -p tcp -m owner --gid-owner tlseraser -j DNAT --to 127.0.0.1:1234
+```
+
+Now change your GID with `sg tlseraser`, make sure everything is right with
+`id`, start TLSEraser and run the process you want to examine.
+
+
+### Intercepting forwarded traffic
+
+Assuming you already obtained a Man-in-the-Middle position, simply create an
+`iptables` rules like this:
+
+```
+iptables -t nat -A PREROUTING -p tcp <matching rules> -j DNAT --to-destination 127.0.0.1:1234
+```

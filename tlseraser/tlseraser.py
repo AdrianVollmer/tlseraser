@@ -92,7 +92,7 @@ class Forwarder(threading.Thread):
         self.erase_tls = erase_tls
         self.active = True
         self.sockets = sockets
-        log.info("Connecting to %s:%d..." % orig_dest)
+        log.info("[%s] Connecting to %s:%d..." % (self.id, *orig_dest))
         try:
             S6 = _open_connection(*orig_dest)
             self.sockets.append(S6)
