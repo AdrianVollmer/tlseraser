@@ -119,7 +119,7 @@ iptables -t nat -A OUTPUT -p tcp -m owner --gid-owner tlseraser -j DNAT --to 127
 ```
 
 Now change your GID with `sg tlseraser`, make sure everything is right with
-`id`, start TLSEraser and run the process you want to examine.
+`id` and that TLSEraser is running, and start the process you want to examine.
 
 
 ### Intercepting forwarded traffic
