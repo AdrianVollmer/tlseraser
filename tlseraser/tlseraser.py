@@ -103,6 +103,7 @@ class Forwarder(threading.Thread):
                 s.close()
             self.active = False
 
+        self.sni = None
         self.init_sockets()
         self.key_cert = None
 
@@ -126,8 +127,11 @@ class Forwarder(threading.Thread):
 
     def disconnect(self, s):
         '''Disconnect a socket and its peer'''
-        self.read_socks.remove(s)
-        self.read_socks.remove(self.peer[s])
+        try:
+            self.read_socks.remove(s)
+            self.read_socks.remove(self.peer[s])
+        except (KeyError, ValueError):
+            pass
         self.active = False
         # check if buffers are all empty
         for key, val in self.buffer.items():
@@ -171,17 +175,18 @@ class Forwarder(threading.Thread):
             if s == self.signal_pipe[0]:
                 os.read(s, 1)
             else:
-                self.read_from_sock(s)
+                if not self.read_from_sock(s):
+                    break
 
     def read_from_sock(self, conn):
         '''Read data from a socket to a buffer'''
         #  log.debug("reading")
         try:
             if self.should_starttls(conn):
-                try:
-                    self.starttls()
-                finally:
-                    return False
+                #  try:
+                self.starttls()
+                #  finally:
+                return False
             else:
                 data = b''
                 while True:
@@ -231,16 +236,23 @@ class Forwarder(threading.Thread):
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
         Client Hello'''
+        log.debug("[%s] Checking for TLS client hello" % self.id)
         try:
-            firstbytes = sock.recv(3, socket.MSG_PEEK)
-            return (len(firstbytes) == 3
-                    and firstbytes[0] == 0x16
-                    and firstbytes[1:3] in [b"\x03\x00",
-                                            b"\x03\x01",
-                                            b"\x03\x02",
-                                            b"\x03\x03",
-                                            b"\x02\x00"]
-                    )
+            firstbytes = sock.recv(5, socket.MSG_PEEK)
+            result = (len(firstbytes) >= 3
+                      and firstbytes[0] == 0x16
+                      and firstbytes[1:3] in [b"\x03\x00",
+                                              b"\x03\x01",
+                                              b"\x03\x02",
+                                              b"\x03\x03",
+                                              b"\x02\x00"]
+                      )
+            if result:
+                from tlseraser.tlsparser import get_sni
+                length = struct.unpack("!H", firstbytes[3:5])[0]
+                tls_client_hello = sock.recv(5+length, socket.MSG_PEEK)
+                self.sni = get_sni(tls_client_hello)
+            return result
         except ValueError:
             log.exception("[%s] Exception while looking for client hello" %
                           self.id)
@@ -250,8 +262,8 @@ class Forwarder(threading.Thread):
         log.debug("[%s] Wrapping connection in TLS" % self.id)
         self.sockets[0] = self.tlsify_server(self.sockets[0])
         self.sockets[5] = self.tlsify_client(self.sockets[5])
-        self.do_tls_handshake(self.sockets[0])
         self.do_tls_handshake(self.sockets[5])
+        self.do_tls_handshake(self.sockets[0])
         self.init_sockets()
 
     def tlsify_server(self, conn):
@@ -259,6 +271,10 @@ class Forwarder(threading.Thread):
         keyfile, certfile = self.get_cached_cert()
         if not (keyfile and certfile):
             keyfile, certfile = self.clone_cert()
+        if not keyfile or not certfile:
+            log.error("Couldn't forge a certificate, disconnecting...")
+            self.disconnect(conn)
+            return conn
         return ssl.wrap_socket(conn,
                                server_side=True,
                                certfile=certfile,
@@ -271,10 +287,12 @@ class Forwarder(threading.Thread):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        log.debug("[%s] Retrieve original certificate and clone it" %
-                  self.id)
         srv = self.sockets[5]
         peer = "%s:%d" % (srv.getpeername())
+        if self.sni:
+            peer = "%s@%s" % (self.sni, peer)
+        log.debug("[%s] Retrieve original certificate and clone it (%s)" %
+                  (self.id, peer))
         if CA_key:
             log.error("[%s] CA not yet implemented" % self.id)
             #  cmd = ["clone-cert.sh", peer, CA_key]  # TODO
@@ -286,13 +304,19 @@ class Forwarder(threading.Thread):
         except subprocess.CalledProcessError as e:
             log.error("[%s] %s - %s" % (self.id, str(e), e.stdout.decode()))
             return None
-        return fake_cert.split(b'\n')[:2]
+        result = fake_cert.split(b'\n')[:2]
+        if not (os.path.isfile(result[0]) and os.path.isfile(result[1])):
+            log.error("clone-cert.sh failed")
+            return None, None
+        return result
 
     def get_cached_cert(self):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
         srv = self.sockets[5]
         peer = "%s:%d" % (srv.getpeername())
+        if self.sni:
+            peer = "%s@%s" % (self.sni, peer)
         cert_filename = os.path.join('/tmp/', '%s_0' % peer)
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
@@ -303,10 +327,13 @@ class Forwarder(threading.Thread):
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
-        return ssl.wrap_socket(
-            conn,
+        context = ssl.SSLContext(
             ssl_version=ssl.PROTOCOL_TLS,
+        )
+        return context.wrap_socket(
+            conn,
             do_handshake_on_connect=False,
+            server_hostname=self.sni,
         )
 
     def do_tls_handshake(self, s):
