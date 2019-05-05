@@ -275,13 +275,14 @@ class Forwarder(threading.Thread):
             log.error("Couldn't forge a certificate, disconnecting...")
             self.disconnect(conn)
             return conn
-        return ssl.wrap_socket(conn,
-                               server_side=True,
-                               certfile=certfile,
-                               keyfile=keyfile,
-                               ssl_version=ssl.PROTOCOL_TLS,
-                               do_handshake_on_connect=False,
-                               )
+        context = ssl.SSLContext(
+            ssl_version=ssl.PROTOCOL_TLS,
+        )
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        return context.wrap_socket(conn,
+                                   server_side=True,
+                                   do_handshake_on_connect=False,
+                                   )
 
     def clone_cert(self, CA_key=None):
         '''Clone a certificate, i.e. preserve all fields except public key
