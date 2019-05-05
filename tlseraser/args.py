@@ -59,6 +59,16 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    '-n',
+    '--netns-name',
+    default="mirror",
+    dest="NETNS_NAME",
+    type=str,
+    help="the name of the mirror network namespace (default: %(default)s)"
+)
+
+
+parser.add_argument(
     '-t',
     '--target',
     dest="TARGET",

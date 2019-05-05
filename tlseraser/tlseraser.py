@@ -344,29 +344,6 @@ def _run_steps(steps, netns_name, devname, subnet, ignore_errors=False):
                 raise
 
 
-_setup_ns = [
-    # create a test network namespace:
-    'ip netns add %(netns)s',
-    # create a pair of virtual network interfaces ($devname-a and $devname):
-    'ip link add %(devname)s-a type veth peer name %(devname)s',
-    # change the active namespace of the $devname-a interface:
-    'ip link set %(devname)s-a netns %(netns)s',
-    # configure the IP addresses of the virtual interfaces:
-    'ip netns exec %(netns)s ip link set %(devname)s-a up',
-    'ip netns exec %(netns)s ip addr add %(subnet)s.1/23 dev %(devname)s-a',
-    'ip link set %(devname)s up',
-    'ip addr add %(subnet)s.254/24 dev %(devname)s',
-    'ip netns exec %(netns)s ip route add default via '
-    '%(subnet)s.254 dev %(devname)s-a'
-]
-
-
-_teardown_ns = [
-    'ip link del %(devname)s',
-    'ip netns del %(netns)s',
-]
-
-
 def _original_dst(conn):
     '''Find original destination of an incoming connection'''
     original_dst = conn.getsockopt(socket.SOL_IP, _SO_ORIGINAL_DST, 16)
@@ -412,6 +389,33 @@ class TLSEraser(object):
             self.target = (target[0], int(target[1]))
         else:
             self.target = None
+
+        self._setup_ns = [
+            # funny hack
+            'ln -fs /proc/1/ns/net /var/run/netns/default',
+            # create a test network namespace:
+            'true' if self.netns_name == 'default'
+            else 'ip netns add %(netns)s',
+            # create a pair of virtual network interfaces ($devname-a and
+            # $devname):
+            'ip link add %(devname)s-a type veth peer name %(devname)s',
+            # change the active namespace of the $devname-a interface:
+            'ip link set %(devname)s-a netns %(netns)s',
+            # configure the IP addresses of the virtual interfaces:
+            'ip netns exec %(netns)s ip link set %(devname)s-a up',
+            'ip netns exec %(netns)s ip addr add %(subnet)s.1/24 '
+            'dev %(devname)s-a',
+            'ip link set %(devname)s up',
+            'ip addr add %(subnet)s.254/24 dev %(devname)s',
+            #  'ip netns exec %(netns)s ip route add default via '
+            #  '%(subnet)s.254 dev %(devname)s-a'
+        ]
+
+        self._teardown_ns = [
+            'ip link del %(devname)s',
+            'true' if self.netns_name == 'default'
+            else 'ip netns del %(netns)s',
+        ]
 
     def accept(self, sock):
         '''Accept incoming connection (S1) and create the other sockets'''
@@ -489,8 +493,8 @@ class TLSEraser(object):
 
     def cleanup(self, exc_type=None, exc=None, traceback=None):
         log.info("Cleaning up")
-        _run_steps(_teardown_ns, self.netns_name, self.devname, self.subnet,
-                   ignore_errors=True)
+        _run_steps(self._teardown_ns, self.netns_name, self.devname,
+                   self.subnet, ignore_errors=True)
         os._exit(0)
         return None
 
@@ -502,11 +506,11 @@ class TLSEraser(object):
         try:
             # remove possibly existing namespace
             netns.get_ns_path(nsname=self.netns_name)
-            _run_steps(_teardown_ns, self.netns_name,
+            _run_steps(self._teardown_ns, self.netns_name,
                        self.devname, self.subnet, ignore_errors=True)
         except Exception:
             pass
-        _run_steps(_setup_ns, self.netns_name, self.devname, self.subnet)
+        _run_steps(self._setup_ns, self.netns_name, self.devname, self.subnet)
         main_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         main_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         log.info('Start listening for incoming connections on %s:%d...' %
