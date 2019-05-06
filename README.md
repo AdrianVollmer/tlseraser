@@ -51,6 +51,8 @@ part of your `$PATH` variable.
 
 ### Via pip
 
+Not yet available - stay tuned.
+
 ```
 pip3 install tlseraser  # as root
 pip3 install --user tlseraser  # as a regular user (recommended)
@@ -70,7 +72,8 @@ Usage
 -----
 
 ```
-usage: example.py [-h] [-p LPORT] [-l LHOST] [-m MIRROR_SUBNET] [-t TARGET]
+usage: example.py [-h] [-p LPORT] [-l LHOST] [-m MIRROR_SUBNET]
+                  [-n NETNS_NAME] [-t TARGET]
                   [--log-level {CRITICAL,ERROR,WARNING,INFO,DEBUG}]
 
 Terminate TLS encrpytion and mirror the clear text traffic on another device
@@ -84,6 +87,9 @@ optional arguments:
   -m MIRROR_SUBNET, --mirror-subnet MIRROR_SUBNET
                         the IP subnet of the pcap mirror (default:
                         192.168.253)
+  -n NETNS_NAME, --netns-name NETNS_NAME
+                        the name of the mirror network namespace (default:
+                        mirror)
   -t TARGET, --target TARGET
                         the target service as <HOST>:<IP>; if none is given
                         (the default), the original destination of NATed TCP
@@ -107,22 +113,23 @@ Wireshark.
 First, create a rule with `iptables` that redirects all traffic you want to
 eavesdrop on to port 1234 on localhost. Then run `tlseraser`.
 
-### Intercepting local traffic
+#### Intercepting local traffic
 
 If you want to intercept traffic originating from your own machine, it's
-best to use `iptables` owner match. Create a new group, say 'tlseraser, with
-`addgroup tlseraser` and add your user to that group: `adduser <username> tlseraser`.
-Next, create an `iptables` rules such as this:
+best to use `iptables` with owner matching. Create a new group, say,
+`tlseraser`, with `addgroup tlseraser` and add your user to that group:
+`adduser <username> tlseraser`.  Next, create an `iptables` rules such as
+this:
 
 ```
-iptables -t nat -A OUTPUT -p tcp -m owner --gid-owner tlseraser -j DNAT --to 127.0.0.1:1234
+iptables -t nat -A OUTPUT -p tcp -m owner --gid-owner tlseraser -j DNAT --to-destination 127.0.0.1:1234
 ```
 
 Now change your GID with `sg tlseraser`, make sure everything is right with
 `id` and that TLSEraser is running, and start the process you want to examine.
 
 
-### Intercepting forwarded traffic
+#### Intercepting forwarded traffic
 
 Assuming you already obtained a Man-in-the-Middle position, simply create an
 `iptables` rules like this:
