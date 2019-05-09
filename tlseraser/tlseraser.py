@@ -145,16 +145,7 @@ class Forwarder(threading.Thread):
         '''The main loop'''
         log.debug("[%s] Start loop" % self.id)
         while self.active:
-            #  try:
             self.forward_data()
-            #  except (ssl.SSLError, ssl.SSLEOFError) as e:
-            #      log.error("SSLError: %s" % str(e))
-            #  except (ConnectionResetError) as e:
-            #      log.error("Connection lost (%s)" % str(e))
-            #      self.disconnect()
-            #  except ValueError as e:
-            #      log.error(e)
-            #      self.disconnect()
 
     def should_starttls(self, conn):
         '''Check if we want and can wrap the sockets in TLS now'''
@@ -166,11 +157,10 @@ class Forwarder(threading.Thread):
 
     def forward_data(self):
         '''Move data from one socket to the other'''
-        #  log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 1)
         self.write_socks = []
         for s in w:
-            self.write_to_sock(s)
+            self.write_from_buffer(s)
         for s in r:
             if s == self.signal_pipe[0]:
                 os.read(s, 1)
@@ -178,42 +168,68 @@ class Forwarder(threading.Thread):
                 if not self.read_from_sock(s):
                     break
 
-    def read_from_sock(self, conn):
+    def tamper(self, sock):
+        if sock == self.sockets[2]:
+            return self.tamper_in(sock)
+        elif sock == self.sockets[3]:
+            return self.tamper_out(sock)
+        else:
+            return True
+
+    def tamper_in(self, s):
+        return True
+
+    def tamper_out(self, s):
+        return True
+
+    def recv_all(self, sock):
+        data = b''
+        while True:
+            part = sock.recv(1024)
+            data += part
+            if len(part) < 1024:  # TODO might block
+                break
+        return data
+
+    def buffer_data(self, sock, data):
+        if data:
+            self.buffer[self.peer[sock]] += data
+            if self.tamper(self.peer[sock]):
+                self.write_socks.append(self.peer[sock])
+        else:
+            self.disconnect(sock)
+
+    def write_from_buffer(self, sock):
+        try:
+            if self.buffer[sock]:
+                c = sock.send(self.buffer[sock])
+                self.buffer[sock] = self.buffer[sock][c:]
+        except (ConnectionResetError, BrokenPipeError):
+            self.disconnect(sock)
+
+    def read_from_sock(self, s):
         '''Read data from a socket to a buffer'''
         #  log.debug("reading")
         try:
-            if self.should_starttls(conn):
+            if self.should_starttls(s):
                 #  try:
                 self.starttls()
                 #  finally:
                 return False
             else:
-                data = b''
-                while True:
-                    part = conn.recv(1024**2)
-                    data += part
-                    # this might return prematurely if less than 1024**2 bytes
-                    # arrive...
-                    if len(part) < 1024**2:
-                        break
+                data = self.recv_all(s)
+                self.buffer_data(s, data)
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return False
         except ssl.SSLError:
             log.exception("[%s] Exception while reading" % self.id)
-            self.disconnect(conn)
+            self.disconnect(s)
             return False
         except (ConnectionResetError, OSError):
-            log.debug("[%s] Connection reset: %s" % (self.id, conn))
-            self.disconnect(conn)
+            log.debug("[%s] Connection reset: %s" % (self.id, s))
+            self.disconnect(s)
             return False
-        if data:
-            #  log.debug('Read %d bytes' % len(data))
-            self.buffer[self.peer[conn]] += data
-            self.write_socks.append(self.peer[conn])
-        else:
-            log.info("[%s] Connection closed" % self.id)
-            self.disconnect(conn)
         return True
 
     def write_to_sock(self, conn):
@@ -404,6 +420,7 @@ class TLSEraser(object):
                  subnet="192.168.253",
                  devname="noTLS",
                  erase_tls=True,
+                 forwarder=Forwarder,
                  target=None
                  ):
         self.lport = lport
@@ -412,6 +429,7 @@ class TLSEraser(object):
         self.subnet = subnet
         self.devname = devname
         self.erase_tls = erase_tls
+        self.forwarder = forwarder
         if target:
             target = target.split(':')
             self.target = (target[0], int(target[1]))
@@ -490,7 +508,10 @@ class TLSEraser(object):
         del _open_ports[_port_id-2]
         S3 = t1.join()
         S5 = t2.join()
-        return Forwarder([S1, S2, S3, S4, S5], orig_dest, self.erase_tls)
+        return self.forwarder([S1, S2, S3, S4, S5],
+                              orig_dest,
+                              self.erase_tls,
+                              )
 
     def start_data_forwarding(self, sock):
         while True:
