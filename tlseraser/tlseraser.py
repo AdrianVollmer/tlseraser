@@ -266,6 +266,7 @@ class Forwarder(threading.Thread):
         peer = "%s:%d" % (sock.getpeername())
         if self.sni:
             peer = "%s@%s" % (self.sni, peer)
+        return peer
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
