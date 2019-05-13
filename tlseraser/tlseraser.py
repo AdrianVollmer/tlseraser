@@ -310,8 +310,8 @@ class Forwarder(threading.Thread):
             try:
                 keyfile, certfile = self.clone_cert()
             except Exception:
-                log.exception("Failed to clone cert, using an obviously \
-                               self-signed one")
+                log.exception("Failed to clone cert, using an obviously "
+                              "self-signed one")
         if not keyfile or not certfile:
             path = os.path.realpath(__file__)
             keyfile = os.path.join(path, 'key.pem')
