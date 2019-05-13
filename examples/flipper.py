@@ -28,6 +28,7 @@ to tamper with the data stream.
 """
 
 from tlseraser.tlseraser import TLSEraser, Forwarder
+from tlseraser.args import args
 from PIL import Image, ImageFile
 from io import BytesIO
 
@@ -93,8 +94,9 @@ class Flipper(Forwarder):
 
 try:
     TLSEraser(
-        8080,
-        lhost='0.0.0.0',
+        args.LPORT,
+        lhost=args.LHOST,
+        netns_name=args.NETNS_NAME,
         forwarder=Flipper,
     ).run()
 except KeyboardInterrupt:
