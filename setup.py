@@ -13,7 +13,13 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/AdrianVollmer/tlseraser",
     packages=setuptools.find_packages(),
-    scripts=['bin/clone-cert.sh'],
+    scripts=[
+        'bin/clone-cert.sh',
+        'examples/flipper.py',
+    ],
+    package_data={
+        'tlseraser': ['*.pem'],
+    },
     install_requires=['netns'],
     entry_points={
         'console_scripts': [

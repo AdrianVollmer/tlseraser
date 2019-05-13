@@ -67,6 +67,19 @@ _SO_ORIGINAL_DST = 80
 
 _open_ports = {}
 _port_id = 0  # counter for referring to open ports between threads
+_cert_locks = []
+
+
+def acquire_cert_lock(peer):
+    while peer in _cert_locks:
+        time.sleep(.1)
+    _cert_locks.append(peer)
+    return peer
+
+
+def release_cert_lock(lock):
+    global _cert_locks
+    _cert_locks.remove(lock)
 
 
 class ThreadWithReturnValue(threading.Thread):
@@ -249,6 +262,11 @@ class Forwarder(threading.Thread):
             except OSError:
                 log.exception("[%s] Exception while writing" % self.id)
 
+    def get_peer(self, sock):
+        peer = "%s:%d" % (sock.getpeername())
+        if self.sni:
+            peer = "%s@%s" % (self.sni, peer)
+
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
         Client Hello'''
@@ -284,13 +302,20 @@ class Forwarder(threading.Thread):
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
+        peer = self.get_peer(conn)
+        lock = acquire_cert_lock(peer)
         keyfile, certfile = self.get_cached_cert()
         if not (keyfile and certfile):
-            keyfile, certfile = self.clone_cert()
+            try:
+                keyfile, certfile = self.clone_cert()
+            except Exception:
+                log.exception("Failed to clone cert, using an obviously \
+                               self-signed one")
         if not keyfile or not certfile:
-            log.error("Couldn't forge a certificate, disconnecting...")
-            self.disconnect(conn)
-            return conn
+            path = os.path.realpath(__file__)
+            keyfile = os.path.join(path, 'key.pem')
+            certfile = os.path.join(path, 'cert.pem')
+        release_cert_lock(lock)
         context = ssl.SSLContext(
             ssl_version=ssl.PROTOCOL_TLS,
         )
@@ -304,10 +329,7 @@ class Forwarder(threading.Thread):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        srv = self.sockets[5]
-        peer = "%s:%d" % (srv.getpeername())
-        if self.sni:
-            peer = "%s@%s" % (self.sni, peer)
+        peer = self.get_peer(self.sockets[5])
         log.debug("[%s] Retrieve original certificate and clone it (%s)" %
                   (self.id, peer))
         if CA_key:
@@ -330,10 +352,7 @@ class Forwarder(threading.Thread):
     def get_cached_cert(self):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
-        srv = self.sockets[5]
-        peer = "%s:%d" % (srv.getpeername())
-        if self.sni:
-            peer = "%s@%s" % (self.sni, peer)
+        peer = self.get_peer(self.sockets[5])
         cert_filename = os.path.join('/tmp/', '%s_0' % peer)
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
