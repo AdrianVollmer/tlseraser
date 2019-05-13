@@ -343,7 +343,7 @@ class Forwarder(threading.Thread):
         except subprocess.CalledProcessError as e:
             log.error("[%s] %s - %s" % (self.id, str(e), e.stdout.decode()))
             return None
-        result = fake_cert.split(b'\n')[:2]
+        result = fake_cert.decode().split('\n')[:2]
         if not (os.path.isfile(result[0]) and os.path.isfile(result[1])):
             log.error("clone-cert.sh failed")
             return None, None
