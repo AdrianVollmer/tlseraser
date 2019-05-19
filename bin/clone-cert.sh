@@ -1,7 +1,29 @@
 #!/bin/bash
-# Adrian Vollmer, SySS GmbH 2017
+# Adrian Vollmer, SySS GmbH 2017-2019
 # Reference:
 # https://security.stackexchange.com/questions/127095/manually-walking-through-the-signature-validation-of-a-certificate
+#
+# MIT License
+#
+# Copyright (c) 2017-2019 Adrian Vollmer, SySS GmbH
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
 
 set -e
 
@@ -108,7 +130,12 @@ function parse_certs () {
             current_cert+="${current_cert:+$nl}$line"
 
             # ...and save it
-            printf "%s" "$current_cert" > "$DIR/${CERTNAME}_$counter"
+            if [ ! -z "$current_cert" ] ; then
+                printf "%s" "$current_cert" > "$DIR/${CERTNAME}_$counter"
+            else
+                echo "Error while parsing certificate" >&2
+                exit 1
+            fi
             counter=$((counter+=1))
 
             # no need to clone the other certs if we have no compromised CA
@@ -198,6 +225,9 @@ function clone_cert () {
         SER_LEN=$(printf "%s" "$SERIAL" | wc -c)
         SER_LEN=$((SER_LEN/2))
         NEW_SERIAL=$(openssl rand -hex $SER_LEN)
+        # avoid negative serial number
+        # if very first bit 1, change it
+        NEW_SERIAL=$(echo $NEW_SERIAL | sed 's/^[4-9a-f]/3/')
     else
         NEW_ISSUER=$ISSUER
         NEW_SERIAL=$SERIAL
@@ -257,12 +287,37 @@ function clone_cert () {
         | openssl dgst -$digest -sign "$SIGNING_KEY" | hexlify)"
 
     # replace signature
-    openssl x509 -in "$CERT_FILE" -outform DER | hexlify \
-        | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
-        | sed "s/$ISSUER/$NEW_ISSUER/" \
-        | sed "s/$SERIAL/$NEW_SERIAL/" \
-        | sed "s/$OLD_SIGNATURE/$NEW_SIGNATURE/" | unhexlify \
-        | openssl x509 -inform DER -outform PEM > "$CLONED_CERT_FILE"
+    if [ ${#NEW_SIGNATURE} = ${#OLD_SIGNATURE} ] ; then
+        openssl x509 -in "$CERT_FILE" -outform DER | hexlify \
+            | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
+            | sed "s/$ISSUER/$NEW_ISSUER/" \
+            | sed "s/$SERIAL/$NEW_SERIAL/" \
+            | sed "s/$OLD_SIGNATURE/$NEW_SIGNATURE/" | unhexlify \
+            | openssl x509 -inform DER -outform PEM > "$CLONED_CERT_FILE"
+    else
+        # if the signatures have different lengths, simply replacing binary
+        # blobs won't work.
+        STRDAY="$(date +%s --date="$(openssl x509 -noout -startdate -in "$CERT_FILE" \
+            | sed 's/^[^=]*=//')" ||:)"
+        ENDDAY="$(date +%s --date="$(openssl x509 -noout -enddate -in "$CERT_FILE" \
+            | sed 's/^[^=]*=//')" ||:)"
+        if which faketime > /dev/null ; then
+            DAYS=$(( ENDDAY/86400 - STRDAY/86400 ))
+            faketime @$STRDAY \
+                openssl x509 -days $DAYS -in "$CERT_FILE" -signkey "$SIGNING_KEY" \
+                2> /dev/null > "$CLONED_CERT_FILE"
+        else
+            openssl x509 -days $DAYS -in "$CERT_FILE" -signkey "$SIGNING_KEY" \
+                2> /dev/null > "$CLONED_CERT_FILE"
+        fi
+    fi
+    if [ ! -s "$CLONED_CERT_FILE" ] ; then
+        echo "Cloning failed" >&2
+        rm "$CLONED_CERT_FILE"
+        rm "$CLONED_KEY_FILE"
+        rm "$CERT_FILE"
+        exit 1
+    fi
     printf "%s\n" "$CLONED_KEY_FILE"
     printf "%s\n" "$CLONED_CERT_FILE"
 }
@@ -297,3 +352,4 @@ for certfile in `ls -r "$DIR/${CERTNAME}_"*` ; do
         fi
     fi
 done
+
