@@ -132,6 +132,7 @@ class Forwarder(threading.Thread):
             for s in self.sockets:
                 s.close()
             self.active = False
+            return None
 
         self.sni = None
         self.init_sockets()
@@ -142,6 +143,10 @@ class Forwarder(threading.Thread):
         self.buffer = {}
         for s in self.sockets:
             self.buffer[s] = b''
+            try:
+                s.setblocking(0)
+            except AttributeError:
+                pass
         self.peer = {
             self.sockets[0]: self.sockets[1],
             self.sockets[1]: self.sockets[0],
@@ -157,6 +162,7 @@ class Forwarder(threading.Thread):
 
     def disconnect(self, s):
         '''Disconnect a socket and its peer'''
+        log.debug("[%s] Disconnecting" % self.id)
         try:
             self.read_socks.remove(s)
             self.read_socks.remove(self.peer[s])
@@ -213,12 +219,7 @@ class Forwarder(threading.Thread):
         return True
 
     def recv_all(self, sock):
-        data = b''
-        while True:
-            part = sock.recv(1024)
-            data += part
-            if len(part) < 1024:  # TODO might block
-                break
+        data = sock.recv(1024**2)
         return data
 
     def buffer_data(self, sock, data):
@@ -242,9 +243,7 @@ class Forwarder(threading.Thread):
         #  log.debug("reading")
         try:
             if self.should_starttls(s):
-                #  try:
                 self.starttls()
-                #  finally:
                 return False
             else:
                 data = self.recv_all(s)
@@ -252,8 +251,13 @@ class Forwarder(threading.Thread):
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return False
-        except ssl.SSLError:
-            log.exception("[%s] Exception while reading" % self.id)
+        except ssl.SSLError as err:
+            if err.reason == "TLSV1_ALERT_UNKNOWN_CA":
+                log.exception(
+                    "[%s] Client does not trust our cert (while reading)"
+                    % self.id)
+            else:
+                log.exception("[%s] Exception while reading" % self.id)
             self.disconnect(s)
             return False
         except (ConnectionResetError, OSError):
@@ -312,10 +316,14 @@ class Forwarder(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("[%s] Wrapping connection in TLS" % self.id)
+        s0 = self.sockets[0]
+        s5 = self.sockets[5]
         self.sockets[0] = self.tlsify_server(self.sockets[0])
         self.sockets[5] = self.tlsify_client(self.sockets[5])
-        self.do_tls_handshake(self.sockets[5])
-        self.do_tls_handshake(self.sockets[0])
+        if not self.do_tls_handshake(self.sockets[5]):
+            self.disconnect(s5)
+        if not self.do_tls_handshake(self.sockets[0]):
+            self.disconnect(s0)
         self.init_sockets()
 
     def tlsify_server(self, conn):
@@ -360,7 +368,7 @@ class Forwarder(threading.Thread):
                                                 stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
             log.error("[%s] %s - %s" % (self.id, str(e), e.stdout.decode()))
-            return None
+            return None, None
         result = fake_cert.decode().split('\n')[:2]
         if not (os.path.isfile(result[0]) and os.path.isfile(result[1])):
             log.error("clone-cert.sh failed")
@@ -375,7 +383,7 @@ class Forwarder(threading.Thread):
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
         if os.path.exists(cert_filename) and os.path.exists(key_filename):
-            log.debug("Get cached certificate for %s" % peer)
+            log.debug("[%s] Get cached certificate for %s" % (self.id, peer))
             return key_filename, cert_filename
         return None, None
 
@@ -400,11 +408,16 @@ class Forwarder(threading.Thread):
                     select.select([s], [], [])
                 elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
                     select.select([], [s], [])
-                elif err.reason == "TLSV1_ALERT_UNKNOWN_CA":
+                elif err.reason in [
+                    "TLSV1_ALERT_UNKNOWN_CA",
+                    "SSLV3_ALERT_BAD_CERTIFICATE",
+                ]:
                     log.error("[%s] Client does not trust our cert" %
                               self.id)
+                    return False
                 else:
                     raise
+        return True
 
 
 def _run_steps(steps, netns_name, devname, subnet, ignore_errors=False):
