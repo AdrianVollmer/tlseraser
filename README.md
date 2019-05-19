@@ -73,7 +73,7 @@ Usage
 
 ```
 usage: example.py [-h] [-p LPORT] [-l LHOST] [-m MIRROR_SUBNET]
-                  [-n NETNS_NAME] [-t TARGET]
+                  [-n NETNS_NAME] [-f {default,flipper}] [-t TARGET]
                   [--log-level {CRITICAL,ERROR,WARNING,INFO,DEBUG}]
 
 Terminate TLS encrpytion and mirror the clear text traffic on another device
@@ -90,6 +90,8 @@ optional arguments:
   -n NETNS_NAME, --netns-name NETNS_NAME
                         the name of the mirror network namespace (default:
                         mirror)
+  -f {default,flipper}, --forwarder {default,flipper}
+                        The Forwarder module to use (default: default)
   -t TARGET, --target TARGET
                         the target service as <HOST>:<IP>; if none is given
                         (the default), the original destination of NATed TCP

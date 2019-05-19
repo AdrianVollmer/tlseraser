@@ -20,7 +20,7 @@
 #  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 #  USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from tlseraser.tlseraser import TLSEraser
+from tlseraser.tlseraser import TLSEraser, Forwarder
 from tlseraser.args import args
 
 import logging
@@ -30,11 +30,17 @@ logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
 
 try:
+    forwarder = Forwarder
+    if args.FORWARDER == "flipper":
+        from tlseraser.flipper import Flipper
+        forwarder = Flipper
+
     TLSEraser(
         args.LPORT,
         args.LHOST,
         target=args.TARGET,
         netns_name=args.NETNS_NAME,
+        forwarder=forwarder,
     ).run()
 except KeyboardInterrupt:
     print('\r', end='')  # prevent '^C' on console

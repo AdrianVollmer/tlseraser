@@ -50,8 +50,10 @@ __author__ = 'Adrian Vollmer'
 
 import atexit
 import os
+import errno
 import socket
 import select
+import shutil
 import signal
 import struct
 import ssl
@@ -68,6 +70,21 @@ _SO_ORIGINAL_DST = 80
 _open_ports = {}
 _port_id = 0  # counter for referring to open ports between threads
 _cert_locks = []
+
+
+# find clone-cert.sh executable
+CLONE_CERT = None
+SCRIPT_PATH = os.path.dirname(__file__)
+for p in ['clone-cert.sh',
+          os.path.join(SCRIPT_PATH, 'bin/clone-cert.sh'),
+          os.path.join(SCRIPT_PATH, '../bin/clone-cert.sh')]:
+    if shutil.which(p):
+        CLONE_CERT = p
+        break
+if not CLONE_CERT:
+    raise FileNotFoundError(errno.ENOENT,
+                            os.strerror(errno.ENOENT),
+                            'clone-cert.sh')
 
 
 def acquire_cert_lock(peer):
@@ -335,9 +352,9 @@ class Forwarder(threading.Thread):
                   (self.id, peer))
         if CA_key:
             log.error("[%s] CA not yet implemented" % self.id)
-            #  cmd = ["clone-cert.sh", peer, CA_key]  # TODO
+            #  cmd = [CLONE_CERT, peer, CA_key]  # TODO
         else:
-            cmd = ["clone-cert.sh", peer]
+            cmd = [CLONE_CERT, peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)

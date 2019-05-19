@@ -27,17 +27,12 @@ project, this script showcases TLSEraser's API and how to use it if you want
 to tamper with the data stream.
 """
 
-from tlseraser.tlseraser import TLSEraser, Forwarder
-from tlseraser.args import args
+from tlseraser.tlseraser import Forwarder
 from PIL import Image, ImageFile
 from io import BytesIO
 
 import logging
-
-level = logging.getLevelName(logging.DEBUG)
-logging.basicConfig(level=level)
 log = logging.getLogger(__name__)
-
 
 image_formats = {
     b'image/jpeg': "JPEG",
@@ -90,15 +85,3 @@ class Flipper(Forwarder):
         except Exception:
             log.debug('Was not an image')
             return True
-
-
-try:
-    TLSEraser(
-        args.LPORT,
-        lhost=args.LHOST,
-        netns_name=args.NETNS_NAME,
-        forwarder=Flipper,
-    ).run()
-except KeyboardInterrupt:
-    print('\r', end='')  # prevent '^C' on console
-    print('Caught Ctrl-C, exiting...')
