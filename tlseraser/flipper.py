@@ -30,6 +30,7 @@ to tamper with the data stream.
 from tlseraser.tlseraser import Forwarder
 from PIL import Image, ImageFile
 from io import BytesIO
+import re
 
 import logging
 log = logging.getLogger(__name__)
@@ -46,42 +47,44 @@ class Flipper(Forwarder):
         log.debug('Tampering with buffer')
         try:
             data = self.buffer[s]
-            header = data.split(b'\x0d\x0a\x0d\x0a')[0]
-            header = header.split(b'\x0d\x0a')
-            header = {x.split(b':')[0]: b':'.join(x.split(b': ')[1:])
-                      for x in header}
-            body = data.split(b'\x0d\x0a\x0d\x0a')[1]
-            con_length = int(header[b'Content-Length'])
+            header, body = data.split(b'\x0d\x0a\x0d\x0a')
+            con_length = re.search(b'Content-Length: ([0-9]+)\x0d\x0a',
+                                   header,
+                                   re.IGNORECASE)
+            con_length = int(con_length.group(1)) if con_length else 0
             if len(body) < con_length:
                 # request is not finished yet
                 log.debug('request not finished')
                 return False
         except Exception:
             # looks like it's not http
-            log.debug('Was not an HTTP request')
+            #  log.debug('Was not an HTTP request')
+            log.exception('exception')
             return True
 
         try:
-            if header[b'Content-Type'] in image_formats.keys():
+            con_type = re.search(b'Content-Type: ([^\x0d\x0a;]+)\x0d\x0a',
+                                 header,
+                                 re.IGNORECASE).group(1)
+            if con_type in image_formats.keys():
                 p = ImageFile.Parser()
                 p.feed(body)
                 im = p.close()
                 im = im.transpose(Image.ROTATE_180)
                 output = BytesIO()
-                im.save(output, format=image_formats[header[b'Content-Type']])
+                im.save(output, format=image_formats[con_type])
                 body = output.getvalue()
                 output.close()
             else:
                 log.debug('unknown mime-type')
                 return True
-            header[b'Content-Length'] = str(len(body)).encode()
-            result = b''
-            for k, v in header.items():
-                result += k + b": " + v + b'\x0d\x0a'
-            result += b'\x0d\x0a' + body
+            header = re.sub(b'Content-Length: [0-9]+\x0d\x0a',
+                            b'Content-Length: (%d)\x0d\x0a' % len(body),
+                            header)
+            result = header + b'\x0d\x0a\x0d\x0a' + body
             self.buffer[s] = result
             log.info('Image flipped')
             return True
         except Exception:
-            log.debug('Was not an image')
+            log.exception('Was not an image')
             return True
