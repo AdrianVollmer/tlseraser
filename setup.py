@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="tlseraser",
-    version="0.0.2",
+    version="0.0.3",
     author="Adrian Vollmer",
     author_email="adrian.vollmer@arcor.de",
     description="Eavesdrop on TLS connections with libpcap",
