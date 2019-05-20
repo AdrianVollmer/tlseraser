@@ -253,7 +253,7 @@ class Forwarder(threading.Thread):
             return False
         except ssl.SSLError as err:
             if err.reason == "TLSV1_ALERT_UNKNOWN_CA":
-                log.exception(
+                log.error(
                     "[%s] Client does not trust our cert (while reading)"
                     % self.id)
             else:
@@ -308,6 +308,7 @@ class Forwarder(threading.Thread):
                 length = struct.unpack("!H", firstbytes[3:5])[0]
                 tls_client_hello = sock.recv(5+length, socket.MSG_PEEK)
                 self.sni = get_sni(tls_client_hello)
+                log.info("[%s] SNI: %s" % (self.id, self.sni))
             return result
         except ValueError:
             log.exception("[%s] Exception while looking for client hello" %
@@ -330,6 +331,7 @@ class Forwarder(threading.Thread):
         '''Wrap an incoming connection inside TLS'''
         peer = self.get_peer(conn)
         lock = acquire_cert_lock(peer)
+        # TODO keep using one issuer
         keyfile, certfile = self.get_cached_cert()
         if not (keyfile and certfile):
             try:
@@ -379,7 +381,15 @@ class Forwarder(threading.Thread):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
         peer = self.get_peer(self.sockets[5])
-        cert_filename = os.path.join('/tmp/', '%s_0' % peer)
+        # ignore IP, go by server name
+        listing = listing = os.listdir('/tmp/')
+        cert_filename = None
+        for f in listing:
+            if f.startswith(self.sni) and f.endswith('_0.cert'):
+                cert_filename = os.path.join('/tmp', f)[:-5]
+                break
+        if not cert_filename:
+            return None, None
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
         if os.path.exists(cert_filename) and os.path.exists(key_filename):
