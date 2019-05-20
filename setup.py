@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="tlseraser",
-    version="0.0.2",
+    version="0.0.3",
     author="Adrian Vollmer",
     author_email="adrian.vollmer@arcor.de",
     description="Eavesdrop on TLS connections with libpcap",
@@ -13,7 +13,13 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/AdrianVollmer/tlseraser",
     packages=setuptools.find_packages(),
-    scripts=['bin/clone-cert.sh'],
+    scripts=[
+        'bin/clone-cert.sh',
+        'examples/flipper.py',
+    ],
+    package_data={
+        'tlseraser': ['*.pem'],
+    },
     install_requires=['netns'],
     entry_points={
         'console_scripts': [

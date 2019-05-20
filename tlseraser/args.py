@@ -67,6 +67,15 @@ parser.add_argument(
     help="the name of the mirror network namespace (default: %(default)s)"
 )
 
+parser.add_argument(
+    '-f',
+    '--forwarder',
+    default="default",
+    dest="FORWARDER",
+    choices=['default', 'flipper'],
+    type=str,
+    help="The Forwarder module to use (default: %(default)s)"
+)
 
 parser.add_argument(
     '-t',

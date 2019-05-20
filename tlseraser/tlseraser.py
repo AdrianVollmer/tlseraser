@@ -32,7 +32,7 @@ with tcpdump.
 
 """
 
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 __author__ = 'Adrian Vollmer'
 
 
@@ -50,8 +50,10 @@ __author__ = 'Adrian Vollmer'
 
 import atexit
 import os
+import errno
 import socket
 import select
+import shutil
 import signal
 import struct
 import ssl
@@ -67,6 +69,34 @@ _SO_ORIGINAL_DST = 80
 
 _open_ports = {}
 _port_id = 0  # counter for referring to open ports between threads
+_cert_locks = []
+
+
+# find clone-cert.sh executable
+CLONE_CERT = None
+SCRIPT_PATH = os.path.dirname(__file__)
+for p in ['clone-cert.sh',
+          os.path.join(SCRIPT_PATH, 'bin/clone-cert.sh'),
+          os.path.join(SCRIPT_PATH, '../bin/clone-cert.sh')]:
+    if shutil.which(p):
+        CLONE_CERT = p
+        break
+if not CLONE_CERT:
+    raise FileNotFoundError(errno.ENOENT,
+                            os.strerror(errno.ENOENT),
+                            'clone-cert.sh')
+
+
+def acquire_cert_lock(peer):
+    while peer in _cert_locks:
+        time.sleep(.1)
+    _cert_locks.append(peer)
+    return peer
+
+
+def release_cert_lock(lock):
+    global _cert_locks
+    _cert_locks.remove(lock)
 
 
 class ThreadWithReturnValue(threading.Thread):
@@ -102,6 +132,7 @@ class Forwarder(threading.Thread):
             for s in self.sockets:
                 s.close()
             self.active = False
+            return None
 
         self.sni = None
         self.init_sockets()
@@ -112,6 +143,10 @@ class Forwarder(threading.Thread):
         self.buffer = {}
         for s in self.sockets:
             self.buffer[s] = b''
+            try:
+                s.setblocking(0)
+            except AttributeError:
+                pass
         self.peer = {
             self.sockets[0]: self.sockets[1],
             self.sockets[1]: self.sockets[0],
@@ -127,6 +162,7 @@ class Forwarder(threading.Thread):
 
     def disconnect(self, s):
         '''Disconnect a socket and its peer'''
+        log.debug("[%s] Disconnecting" % self.id)
         try:
             self.read_socks.remove(s)
             self.read_socks.remove(self.peer[s])
@@ -145,16 +181,7 @@ class Forwarder(threading.Thread):
         '''The main loop'''
         log.debug("[%s] Start loop" % self.id)
         while self.active:
-            #  try:
             self.forward_data()
-            #  except (ssl.SSLError, ssl.SSLEOFError) as e:
-            #      log.error("SSLError: %s" % str(e))
-            #  except (ConnectionResetError) as e:
-            #      log.error("Connection lost (%s)" % str(e))
-            #      self.disconnect()
-            #  except ValueError as e:
-            #      log.error(e)
-            #      self.disconnect()
 
     def should_starttls(self, conn):
         '''Check if we want and can wrap the sockets in TLS now'''
@@ -166,11 +193,10 @@ class Forwarder(threading.Thread):
 
     def forward_data(self):
         '''Move data from one socket to the other'''
-        #  log.debug('selecting sockets...')
         r, w, _ = select.select(self.read_socks, self.write_socks, [], 1)
         self.write_socks = []
         for s in w:
-            self.write_to_sock(s)
+            self.write_from_buffer(s)
         for s in r:
             if s == self.signal_pipe[0]:
                 os.read(s, 1)
@@ -178,42 +204,66 @@ class Forwarder(threading.Thread):
                 if not self.read_from_sock(s):
                     break
 
-    def read_from_sock(self, conn):
+    def tamper(self, sock):
+        if sock == self.sockets[2]:
+            return self.tamper_in(sock)
+        elif sock == self.sockets[3]:
+            return self.tamper_out(sock)
+        else:
+            return True
+
+    def tamper_in(self, s):
+        return True
+
+    def tamper_out(self, s):
+        return True
+
+    def recv_all(self, sock):
+        data = sock.recv(1024**2)
+        return data
+
+    def buffer_data(self, sock, data):
+        if data:
+            self.buffer[self.peer[sock]] += data
+            if self.tamper(self.peer[sock]):
+                self.write_socks.append(self.peer[sock])
+        else:
+            self.disconnect(sock)
+
+    def write_from_buffer(self, sock):
+        try:
+            if self.buffer[sock]:
+                c = sock.send(self.buffer[sock])
+                self.buffer[sock] = self.buffer[sock][c:]
+        except (ConnectionResetError, BrokenPipeError):
+            self.disconnect(sock)
+
+    def read_from_sock(self, s):
         '''Read data from a socket to a buffer'''
         #  log.debug("reading")
         try:
-            if self.should_starttls(conn):
-                #  try:
+            if self.should_starttls(s):
                 self.starttls()
-                #  finally:
                 return False
             else:
-                data = b''
-                while True:
-                    part = conn.recv(1024**2)
-                    data += part
-                    # this might return prematurely if less than 1024**2 bytes
-                    # arrive...
-                    if len(part) < 1024**2:
-                        break
+                data = self.recv_all(s)
+                self.buffer_data(s, data)
         except ssl.SSLWantReadError:
             # can be ignored. data will be read next time
             return False
-        except ssl.SSLError:
-            log.exception("[%s] Exception while reading" % self.id)
-            self.disconnect(conn)
+        except ssl.SSLError as err:
+            if err.reason == "TLSV1_ALERT_UNKNOWN_CA":
+                log.error(
+                    "[%s] Client does not trust our cert (while reading)"
+                    % self.id)
+            else:
+                log.exception("[%s] Exception while reading" % self.id)
+            self.disconnect(s)
             return False
         except (ConnectionResetError, OSError):
-            log.debug("[%s] Connection reset: %s" % (self.id, conn))
-            self.disconnect(conn)
+            log.debug("[%s] Connection reset: %s" % (self.id, s))
+            self.disconnect(s)
             return False
-        if data:
-            #  log.debug('Read %d bytes' % len(data))
-            self.buffer[self.peer[conn]] += data
-            self.write_socks.append(self.peer[conn])
-        else:
-            log.info("[%s] Connection closed" % self.id)
-            self.disconnect(conn)
         return True
 
     def write_to_sock(self, conn):
@@ -232,6 +282,12 @@ class Forwarder(threading.Thread):
                 self.write_socks.append(conn)
             except OSError:
                 log.exception("[%s] Exception while writing" % self.id)
+
+    def get_peer(self, sock):
+        peer = "%s:%d" % (sock.getpeername())
+        if self.sni:
+            peer = "%s@%s" % (self.sni, peer)
+        return peer
 
     def got_client_hello(self, sock):
         '''Peek inside the connection and return True if we see a
@@ -252,6 +308,7 @@ class Forwarder(threading.Thread):
                 length = struct.unpack("!H", firstbytes[3:5])[0]
                 tls_client_hello = sock.recv(5+length, socket.MSG_PEEK)
                 self.sni = get_sni(tls_client_hello)
+                log.info("[%s] SNI: %s" % (self.id, self.sni))
             return result
         except ValueError:
             log.exception("[%s] Exception while looking for client hello" %
@@ -260,51 +317,61 @@ class Forwarder(threading.Thread):
     def starttls(self):
         '''Wrap a connection and its counterpart inside TLS'''
         log.debug("[%s] Wrapping connection in TLS" % self.id)
+        s0 = self.sockets[0]
+        s5 = self.sockets[5]
         self.sockets[0] = self.tlsify_server(self.sockets[0])
         self.sockets[5] = self.tlsify_client(self.sockets[5])
-        self.do_tls_handshake(self.sockets[5])
-        self.do_tls_handshake(self.sockets[0])
+        if not self.do_tls_handshake(self.sockets[5]):
+            self.disconnect(s5)
+        if not self.do_tls_handshake(self.sockets[0]):
+            self.disconnect(s0)
         self.init_sockets()
 
     def tlsify_server(self, conn):
         '''Wrap an incoming connection inside TLS'''
+        peer = self.get_peer(conn)
+        lock = acquire_cert_lock(peer)
+        # TODO keep using one issuer
         keyfile, certfile = self.get_cached_cert()
         if not (keyfile and certfile):
-            keyfile, certfile = self.clone_cert()
+            try:
+                keyfile, certfile = self.clone_cert()
+            except Exception:
+                log.exception("Failed to clone cert, using an obviously "
+                              "self-signed one")
         if not keyfile or not certfile:
-            log.error("Couldn't forge a certificate, disconnecting...")
-            self.disconnect(conn)
-            return conn
-        return ssl.wrap_socket(conn,
-                               server_side=True,
-                               certfile=certfile,
-                               keyfile=keyfile,
-                               ssl_version=ssl.PROTOCOL_TLS,
-                               do_handshake_on_connect=False,
-                               )
+            path = os.path.realpath(__file__)
+            keyfile = os.path.join(path, 'key.pem')
+            certfile = os.path.join(path, 'cert.pem')
+        release_cert_lock(lock)
+        context = ssl.SSLContext(
+            ssl_version=ssl.PROTOCOL_TLS,
+        )
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        return context.wrap_socket(conn,
+                                   server_side=True,
+                                   do_handshake_on_connect=False,
+                                   )
 
     def clone_cert(self, CA_key=None):
         '''Clone a certificate, i.e. preserve all fields except public key
 
         It will be self-signed unless the private key of a CA is given'''
-        srv = self.sockets[5]
-        peer = "%s:%d" % (srv.getpeername())
-        if self.sni:
-            peer = "%s@%s" % (self.sni, peer)
+        peer = self.get_peer(self.sockets[5])
         log.debug("[%s] Retrieve original certificate and clone it (%s)" %
                   (self.id, peer))
         if CA_key:
             log.error("[%s] CA not yet implemented" % self.id)
-            #  cmd = ["clone-cert.sh", peer, CA_key]  # TODO
+            #  cmd = [CLONE_CERT, peer, CA_key]  # TODO
         else:
-            cmd = ["clone-cert.sh", peer]
+            cmd = [CLONE_CERT, peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
             log.error("[%s] %s - %s" % (self.id, str(e), e.stdout.decode()))
-            return None
-        result = fake_cert.split(b'\n')[:2]
+            return None, None
+        result = fake_cert.decode().split('\n')[:2]
         if not (os.path.isfile(result[0]) and os.path.isfile(result[1])):
             log.error("clone-cert.sh failed")
             return None, None
@@ -313,15 +380,20 @@ class Forwarder(threading.Thread):
     def get_cached_cert(self):
         '''Returns a cached certificate. Result is 'None, None' if it hasn't
         been cached yet'''
-        srv = self.sockets[5]
-        peer = "%s:%d" % (srv.getpeername())
-        if self.sni:
-            peer = "%s@%s" % (self.sni, peer)
-        cert_filename = os.path.join('/tmp/', '%s_0' % peer)
+        peer = self.get_peer(self.sockets[5])
+        # ignore IP, go by server name
+        listing = listing = os.listdir('/tmp/')
+        cert_filename = None
+        for f in listing:
+            if f.startswith(self.sni) and f.endswith('_0.cert'):
+                cert_filename = os.path.join('/tmp', f)[:-5]
+                break
+        if not cert_filename:
+            return None, None
         key_filename = cert_filename + '.key'
         cert_filename = cert_filename + '.cert'
         if os.path.exists(cert_filename) and os.path.exists(key_filename):
-            log.debug("Get cached certificate for %s" % peer)
+            log.debug("[%s] Get cached certificate for %s" % (self.id, peer))
             return key_filename, cert_filename
         return None, None
 
@@ -346,11 +418,16 @@ class Forwarder(threading.Thread):
                     select.select([s], [], [])
                 elif err.args[0] == ssl.SSL_ERROR_WANT_WRITE:
                     select.select([], [s], [])
-                elif err.reason == "TLSV1_ALERT_UNKNOWN_CA":
+                elif err.reason in [
+                    "TLSV1_ALERT_UNKNOWN_CA",
+                    "SSLV3_ALERT_BAD_CERTIFICATE",
+                ]:
                     log.error("[%s] Client does not trust our cert" %
                               self.id)
+                    return False
                 else:
                     raise
+        return True
 
 
 def _run_steps(steps, netns_name, devname, subnet, ignore_errors=False):
@@ -403,6 +480,7 @@ class TLSEraser(object):
                  subnet="192.168.253",
                  devname="noTLS",
                  erase_tls=True,
+                 forwarder=Forwarder,
                  target=None
                  ):
         self.lport = lport
@@ -411,6 +489,7 @@ class TLSEraser(object):
         self.subnet = subnet
         self.devname = devname
         self.erase_tls = erase_tls
+        self.forwarder = forwarder
         if target:
             target = target.split(':')
             self.target = (target[0], int(target[1]))
@@ -489,7 +568,10 @@ class TLSEraser(object):
         del _open_ports[_port_id-2]
         S3 = t1.join()
         S5 = t2.join()
-        return Forwarder([S1, S2, S3, S4, S5], orig_dest, self.erase_tls)
+        return self.forwarder([S1, S2, S3, S4, S5],
+                              orig_dest,
+                              self.erase_tls,
+                              )
 
     def start_data_forwarding(self, sock):
         while True:
