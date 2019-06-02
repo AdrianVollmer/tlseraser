@@ -164,6 +164,8 @@ class Forwarder(threading.Thread):
         '''Disconnect a socket and its peer'''
         log.debug("[%s] Disconnecting" % self.id)
         try:
+            s.close()
+            self.peer[s].close()
             self.read_socks.remove(s)
             self.read_socks.remove(self.peer[s])
         except (KeyError, ValueError):
@@ -261,7 +263,7 @@ class Forwarder(threading.Thread):
             self.disconnect(s)
             return False
         except (ConnectionResetError, OSError):
-            log.debug("[%s] Connection reset: %s" % (self.id, s))
+            log.debug("[%s] Connection reset" % self.id)
             self.disconnect(s)
             return False
         return True
@@ -364,7 +366,7 @@ class Forwarder(threading.Thread):
             log.error("[%s] CA not yet implemented" % self.id)
             #  cmd = [CLONE_CERT, peer, CA_key]  # TODO
         else:
-            cmd = [CLONE_CERT, peer]
+            cmd = [CLONE_CERT, '--reuse-keys', peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
