@@ -47,7 +47,10 @@ class Flipper(Forwarder):
         log.debug('Tampering with buffer')
         try:
             data = self.buffer[s]
-            header, body = data.split(b'\x0d\x0a\x0d\x0a')
+            try:
+                header, body = data.split(b'\x0d\x0a\x0d\x0a')[:2]
+            except ValueError:
+                return True
             con_length = re.search(b'Content-Length: ([0-9]+)\x0d\x0a',
                                    header,
                                    re.IGNORECASE)
@@ -65,7 +68,9 @@ class Flipper(Forwarder):
         try:
             con_type = re.search(b'Content-Type: ([^\x0d\x0a;]+)\x0d\x0a',
                                  header,
-                                 re.IGNORECASE).group(1)
+                                 re.IGNORECASE)
+            con_type = con_type.group(1) if con_type else None
+
             if con_type in image_formats.keys():
                 p = ImageFile.Parser()
                 p.feed(body)
@@ -79,7 +84,7 @@ class Flipper(Forwarder):
                 log.debug('unknown mime-type')
                 return True
             header = re.sub(b'Content-Length: [0-9]+\x0d\x0a',
-                            b'Content-Length: (%d)\x0d\x0a' % len(body),
+                            b'Content-Length: %d\x0d\x0a' % len(body),
                             header)
             result = header + b'\x0d\x0a\x0d\x0a' + body
             self.buffer[s] = result
