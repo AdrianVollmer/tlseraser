@@ -346,9 +346,7 @@ class Forwarder(threading.Thread):
             keyfile = os.path.join(path, 'key.pem')
             certfile = os.path.join(path, 'cert.pem')
         release_cert_lock(lock)
-        context = ssl.SSLContext(
-            ssl_version=ssl.PROTOCOL_TLS,
-        )
+        context = ssl.SSLContext()
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
         return context.wrap_socket(conn,
                                    server_side=True,
@@ -401,9 +399,7 @@ class Forwarder(threading.Thread):
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
-        context = ssl.SSLContext(
-            ssl_version=ssl.PROTOCOL_TLS,
-        )
+        context = ssl.SSLContext()
         return context.wrap_socket(
             conn,
             do_handshake_on_connect=False,
