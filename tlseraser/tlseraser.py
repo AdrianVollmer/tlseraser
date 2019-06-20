@@ -32,7 +32,7 @@ with tcpdump.
 
 """
 
-__version__ = '0.0.3'
+__version__ = '0.0.4'
 __author__ = 'Adrian Vollmer'
 
 
@@ -164,6 +164,8 @@ class Forwarder(threading.Thread):
         '''Disconnect a socket and its peer'''
         log.debug("[%s] Disconnecting" % self.id)
         try:
+            s.close()
+            self.peer[s].close()
             self.read_socks.remove(s)
             self.read_socks.remove(self.peer[s])
         except (KeyError, ValueError):
@@ -261,7 +263,7 @@ class Forwarder(threading.Thread):
             self.disconnect(s)
             return False
         except (ConnectionResetError, OSError):
-            log.debug("[%s] Connection reset: %s" % (self.id, s))
+            log.debug("[%s] Connection reset" % self.id)
             self.disconnect(s)
             return False
         return True
@@ -344,9 +346,7 @@ class Forwarder(threading.Thread):
             keyfile = os.path.join(path, 'key.pem')
             certfile = os.path.join(path, 'cert.pem')
         release_cert_lock(lock)
-        context = ssl.SSLContext(
-            ssl_version=ssl.PROTOCOL_TLS,
-        )
+        context = ssl.SSLContext()
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
         return context.wrap_socket(conn,
                                    server_side=True,
@@ -364,7 +364,7 @@ class Forwarder(threading.Thread):
             log.error("[%s] CA not yet implemented" % self.id)
             #  cmd = [CLONE_CERT, peer, CA_key]  # TODO
         else:
-            cmd = [CLONE_CERT, peer]
+            cmd = [CLONE_CERT, '--reuse-keys', peer]
         try:
             fake_cert = subprocess.check_output(cmd,
                                                 stderr=subprocess.STDOUT)
@@ -399,9 +399,7 @@ class Forwarder(threading.Thread):
 
     def tlsify_client(self, conn):
         '''Wrap an outgoing connection inside TLS'''
-        context = ssl.SSLContext(
-            ssl_version=ssl.PROTOCOL_TLS,
-        )
+        context = ssl.SSLContext()
         return context.wrap_socket(
             conn,
             do_handshake_on_connect=False,
