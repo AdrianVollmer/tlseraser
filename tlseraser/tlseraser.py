@@ -342,10 +342,10 @@ class Forwarder(threading.Thread):
                 log.exception("Failed to clone cert, using an obviously "
                               "self-signed one")
         if not (keyfile and certfile):
-            path = os.path.realpath(__file__)
+            path = os.path.dirname(os.path.realpath(__file__))
             keyfile = os.path.join(path, 'key.pem')
             certfile = os.path.join(path, 'cert.pem')
-            log.warning("[%] Use fallback certificate" % self.id)
+            log.warning("[%s] Use fallback certificate" % self.id)
         release_cert_lock(lock)
         context = ssl.SSLContext()
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
