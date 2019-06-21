@@ -345,6 +345,7 @@ class Forwarder(threading.Thread):
             path = os.path.realpath(__file__)
             keyfile = os.path.join(path, 'key.pem')
             certfile = os.path.join(path, 'cert.pem')
+            log.warning("[%] Use fallback certificate" % self.id)
         release_cert_lock(lock)
         context = ssl.SSLContext()
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
