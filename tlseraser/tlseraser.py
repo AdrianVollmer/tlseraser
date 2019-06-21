@@ -342,17 +342,25 @@ class Forwarder(threading.Thread):
                 log.exception("Failed to clone cert, using an obviously "
                               "self-signed one")
         if not (keyfile and certfile):
-            path = os.path.dirname(os.path.realpath(__file__))
-            keyfile = os.path.join(path, 'key.pem')
-            certfile = os.path.join(path, 'cert.pem')
-            log.warning("[%s] Use fallback certificate" % self.id)
+            certfile, keyfile = self.fallback_cert()
         release_cert_lock(lock)
         context = ssl.SSLContext()
-        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        try:
+            context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        except ssl.SSLError:
+            certfile, keyfile = self.fallback_cert()
+            context.load_cert_chain(certfile=certfile, keyfile=keyfile)
         return context.wrap_socket(conn,
                                    server_side=True,
                                    do_handshake_on_connect=False,
                                    )
+
+    def fallback_cert(self):
+        path = os.path.dirname(os.path.realpath(__file__))
+        keyfile = os.path.join(path, 'key.pem')
+        certfile = os.path.join(path, 'cert.pem')
+        log.warning("[%s] Use fallback certificate" % self.id)
+        return certfile, keyfile
 
     def clone_cert(self, CA_key=None):
         '''Clone a certificate, i.e. preserve all fields except public key
