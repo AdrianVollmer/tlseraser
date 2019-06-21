@@ -285,6 +285,21 @@ function unhexlify(){
     xxd -p -r
 }
 
+function asn1-bitstring(){
+    # https://docs.microsoft.com/en-us/windows/desktop/seccertenroll/about-bit-string
+    data=$1
+    len=$((${#data}/2+1))
+    if [ $len -le 127 ] ; then
+        len=$(printf "%02x" $len)
+    else
+        if [ $len -lt 256 ] ; then
+            len=$(printf "81%02x" $len)
+        else
+            len=$(printf "82%04x" $len)
+        fi
+    fi
+    printf "03%s00%s" $len $data
+}
 
 function extract-values () {
     # extract all the values we need from the original cert
@@ -331,8 +346,9 @@ function clone_cert () {
             NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/.$/ /")
         fi
         # avoid negative serial number
-        # if very first bit 1, change it
-        NEW_SERIAL=$(echo $NEW_SERIAL | sed 's/^[4-9a-f]/3/')
+        # only change 16 hex digits in the middle
+        NEW_SERIAL=$(openssl rand -hex 8)
+        NEW_SERIAL=$(printf "%s" "$SERIAL" | sed "s/.\{16\}\(.\{4\}\)\$/$NEW_SERIAL\1/")
     else
         NEW_ISSUER=$ISSUER
         NEW_SERIAL=$SERIAL
@@ -349,8 +365,9 @@ function clone_cert () {
     OLD_MODULUS="$(openssl x509 -in "$CERT" -modulus -noout \
         | sed -e 's/Modulus=//' | tr "[:upper:]" "[:lower:]")"
     if [[ $OLD_MODULUS = "wrong algorithm type" ]] ; then
-        # it's EC and not RSA
-        offset="$(openssl x509 -in "$CERT_FILE" -pubkey -noout 2> /dev/null \
+        # it's EC and not RSA (or maybe DSA...)
+        SCHEME=ec
+        offset="$(openssl x509 -in "$CERT" -pubkey -noout 2> /dev/null \
             | openssl asn1parse \
             | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/')"
         OLD_MODULUS="$(openssl x509 -in "$CERT" -pubkey -noout 2> /dev/null \
@@ -384,20 +401,43 @@ function clone_cert () {
         # get the key length of the public key
         KEY_LEN="$(openssl x509  -in "$CERT" -noout -text \
             | grep Public-Key: | grep -o "[0-9]\+")"
-        NEW_MODULUS="$(generate_rsa_key "$KEY_LEN" "$CLONED_KEY_FILE")"
-        # get the key length of the issuer (or length of the signature)
-        ISSUER_KEY_LEN="$(openssl x509  -in "$CERT_FILE" -noout -text \
-            -certopt ca_default -certopt no_validity \
-            -certopt no_serial -certopt no_subject -certopt no_extensions \
-            -certopt no_signame | tail -n+2 | tr -d ": \n" | wc -c)"
-        ISSUER_KEY_LEN=$((ISSUER_KEY_LEN/2*8))
-        if [ $ISSUER = $SUBJECT ] ; then
-            FAKE_ISSUER_KEY_FILE="$CLONED_KEY_FILE"
-            FAKE_ISSUER_CERT="$CLONED_CERT_FILE"
+        NEW_MODULUS="$(generate_rsa_key "$KEY_LEN" "$CLONED_KEY")"
+        if [[ $SELF_SIGNED = true ]] ; then
+            FAKE_ISSUER_KEY="$CLONED_KEY"
+            FAKE_ISSUER_CERT="$CLONED_CERT"
         else
-            openssl req -x509 -new -nodes -newkey rsa:$ISSUER_KEY_LEN \
-                -keyout "$FAKE_ISSUER_KEY_FILE" -days 1024 -out "$FAKE_ISSUER_CERT_FILE" \
-                -sha256  -subj "$NEW_ISSUER_DN" 2> /dev/null
+            if [[ $REUSE_KEYS = true ]] && [[ -f "$DIR/RSA_2048" ]] ; then
+                openssl req -x509 -new -nodes -days 1024 -sha256 \
+                    -subj "$NEW_ISSUER_DN" \
+                    -addext subjectKeyIdentifier="$AUTH_KEY_IDENTIFIER" \
+                    -key "$DIR/RSA_2048" \
+                    -out "$FAKE_ISSUER_CERT" 2> /dev/null
+                FAKE_ISSUER_KEY="$DIR/RSA_2048"
+            else
+                openssl req -x509 -new -nodes -days 1024 -sha256 \
+                    -subj "$NEW_ISSUER_DN" \
+                    -addext subjectKeyIdentifier="$AUTH_KEY_IDENTIFIER" \
+                    -newkey rsa:2048 \
+                    -keyout "$FAKE_ISSUER_KEY" \
+                    -out "$FAKE_ISSUER_CERT" 2> /dev/null
+            fi
+        fi
+    fi
+
+    if [ ! -z "$ISSUER_CERT" -a ! -z "$ISSUER_KEY" ] ; then
+        # sign it regularly with given cert
+        FAKE_ISSUER_KEY="$ISSUER_KEY"
+        FAKE_ISSUER_CERT="$ISSUER_CERT"
+        openssl x509 -in "$CERT" -outform DER | hexlify \
+            | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
+            | unhexlify \
+            | openssl x509 -days 356 -inform DER -CAkey "$ISSUER_KEY" \
+                -CA "$ISSUER_CERT" -CAcreateserial \
+                -out "$CLONED_CERT"  2> /dev/null
+        return-result
+    else
+        if [ ! -z "$ISSUER_CERT" -o ! -z "$ISSUER_KEY" ] ; then
+            die "If you provide one of <KEY> or <CERT>, you must also provide the other"
         fi
     fi
 
@@ -416,40 +456,38 @@ function clone_cert () {
 
     # create new signature
     NEW_TBS_CERTIFICATE="$(printf "%s" "$OLD_TBS_CERTIFICATE" \
+        | sed "s/$ISSUER/$NEW_ISSUER/" \
+        | sed "s/$SERIAL/$NEW_SERIAL/" \
         | sed "s/$OLD_MODULUS/$NEW_MODULUS/")"
 
     digest="$(oid "$SIGNING_ALGO")"
     NEW_SIGNATURE="$(printf "%s" "$NEW_TBS_CERTIFICATE" | unhexlify \
-        | openssl dgst -$digest | openssl pkeyutl -sign "$SIGNING_KEY" | hexlify)"
+        | openssl $digest -sign "$FAKE_ISSUER_KEY" \
+        | hexlify)"
 
-    # replace signature
-    if [ ${#NEW_SIGNATURE} = ${#OLD_SIGNATURE} ] ; then
-        openssl x509 -in "$CERT_FILE" -outform DER | hexlify \
-            | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
-            | sed "s/$ISSUER/$NEW_ISSUER/" \
-            | sed "s/$SERIAL/$NEW_SERIAL/" \
-            | sed "s/$OLD_SIGNATURE/$NEW_SIGNATURE/" \
-            | unhexlify \
-            | openssl x509 -inform DER -outform PEM > "$CLONED_CERT_FILE"
-    else
-        # if the signatures have different lengths, simply replacing binary
-        # blobs won't work.
-        # TODO this causes it to be self-signed
-        STRDAY="$(date +%s --date="$(openssl x509 -noout -startdate -in "$CERT_FILE" \
-            | sed 's/^[^=]*=//')" ||:)"
-        ENDDAY="$(date +%s --date="$(openssl x509 -noout -enddate -in "$CERT_FILE" \
-            | sed 's/^[^=]*=//')" ||:)"
-        DAYS=$(( ENDDAY/86400 - STRDAY/86400 ))
-        if which faketime > /dev/null ; then
-            faketime @$STRDAY \
-                openssl x509 -days $DAYS -in "$CERT_FILE" -signkey "$SIGNING_KEY" \
-                2> /dev/null > "$CLONED_CERT_FILE"
-        else
-            openssl x509 -days $DAYS -in "$CERT_FILE" -signkey "$SIGNING_KEY" \
-                2> /dev/null > "$CLONED_CERT_FILE"
-        fi
-    fi
-    if [ ! -s "$CLONED_CERT_FILE" ] ; then
+    # replace signature, compute new asn1 length
+    OLD_ASN1_SIG=$(asn1-bitstring $OLD_SIGNATURE)
+    NEW_ASN1_SIG=$(asn1-bitstring $NEW_SIGNATURE)
+
+    OLD_CERT_LENGTH="$(openssl x509 -in "$CERT" -outform der \
+        | dd bs=2 skip=1 count=1 2> /dev/null | hexlify)"
+    OLD_CERT_LENGTH=$((16#$OLD_CERT_LENGTH))
+    NEW_CERT_LENGTH=$((OLD_CERT_LENGTH \
+        -${#OLD_ASN1_SIG}/2+${#NEW_ASN1_SIG}/2 \
+        ))
+    OLD_CERT_LENGTH="$(printf "%04x" $OLD_CERT_LENGTH)"
+    NEW_CERT_LENGTH="$(printf "%04x" $NEW_CERT_LENGTH)"
+
+    openssl x509 -in "$CERT" -outform DER | hexlify \
+        | sed "s/$OLD_MODULUS/$NEW_MODULUS/" \
+        | sed "s/$ISSUER/$NEW_ISSUER/" \
+        | sed "s/$SERIAL/$NEW_SERIAL/" \
+        | sed "s/$OLD_ASN1_SIG/$NEW_ASN1_SIG/" \
+        | sed "s/^\(....\)$OLD_CERT_LENGTH/\1$NEW_CERT_LENGTH/" \
+        | unhexlify \
+        | openssl x509 -inform DER -outform PEM > "$CLONED_CERT"
+
+    if [ ! -s "$CLONED_CERT" ] ; then
         echo "Cloning failed" >&2
         rm "$CLONED_CERT"
         rm "$CLONED_KEY"
@@ -465,14 +503,14 @@ function return-result () {
     exit 0
 }
 
-# save all certificates in chain
-if [[ -f "$HOST" ]] ; then
-    cat "$HOST" | parse_certs
-else
-    openssl s_client -servername "$SNI" \
-        -showcerts -connect "$HOST" < /dev/null 2>/dev/null | \
-         parse_certs
-fi
+function sanity-check () {
+    # check whether the key pair matches, and whether the cert validates
+    diff -q <(openssl x509 -in "$CLONED_CERT" -pubkey -noout 2> /dev/null ) \
+        <(openssl $SCHEME -in "$CLONED_KEY" -pubout 2> /dev/null) \
+        || ( echo Key mismatch, probably due to a bug >&2; return 1 )
+    openssl verify -CAfile "$FAKE_ISSUER_CERT" "$CLONED_CERT" > /dev/null \
+        || ( echo Verification failed, probably due to a bug >&2; return 1 )
+}
 
 function main () {
     if [[ -f "$HOST" ]] ; then
