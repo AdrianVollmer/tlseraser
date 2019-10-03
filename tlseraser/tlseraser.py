@@ -496,6 +496,7 @@ class TLSEraser(object):
 
         self._setup_ns = [
             # funny hack
+            'mkdir -p /var/run/netns',
             'ln -fs /proc/1/ns/net /var/run/netns/default',
             # create a test network namespace:
             'true' if self.netns_name == 'default'
