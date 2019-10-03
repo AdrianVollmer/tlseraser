@@ -526,9 +526,10 @@ class TLSEraser(object):
         '''Accept incoming connection (S1) and create the other sockets'''
         global _port_id, _open_ports
         S1, addr = sock.accept()  # Should be ready
-        orig_dest = _original_dst(S1)
         if self.target:
             orig_dest = self.target
+        else:
+            orig_dest = _original_dst(S1)
         log.info('Accepted from %s:%d with target %s:%d' %
                  (*addr, *orig_dest))
         S1.setblocking(False)
